@@ -287,6 +287,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "proofline-fuzzer"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proofline-core",
+ "proofline-sandbox",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "proofline-intelligence"
 version = "0.1.0"
 dependencies = [
