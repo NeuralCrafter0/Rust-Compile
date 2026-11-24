@@ -287,6 +287,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "proofline-differential"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proofline-core",
+ "proofline-fuzzer",
+ "proofline-sandbox",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "proofline-fuzzer"
 version = "0.1.0"
 dependencies = [
