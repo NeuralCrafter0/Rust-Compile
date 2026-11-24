@@ -4,6 +4,8 @@ members = [
     "crates/proofline-core",
     "crates/proofline-intelligence",
     "crates/proofline-sandbox",
+    "crates/proofline-cpg",
+    "crates/proofline-analysis",
 ]
 
 [workspace.package]

@@ -252,6 +252,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "proofline-analysis"
+version = "0.1.0"
+dependencies = [
+ "proofline-core",
+ "proofline-cpg",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "proofline-core"
 version = "0.1.0"
 dependencies = [
@@ -261,6 +273,17 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "proofline-cpg"
+version = "0.1.0"
+dependencies = [
+ "proofline-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
