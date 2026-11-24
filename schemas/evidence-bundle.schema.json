@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://proofline.dev/schemas/v1/evidence-bundle.schema.json",
+  "title": "ProoflineEvidenceBundleManifest",
+  "description": "Cryptographically verifiable manifest for a Proofline Evidence Bundle archive.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "bundle_id",
+    "timestamp",
+    "target_repository",
+    "target_commits",
+    "epistemic_tier",
+    "reproduction_witness",
+    "differential_verification",
+    "cas_hashes",
+    "attestation"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "bundle_id": {
+      "type": "string",
+      "pattern": "^EVD-[0-9]{4}-[A-Z0-9_-]+$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "target_repository": {
+      "type": "string",
+      "format": "uri"
+    },
+    "target_commits": {
+      "type": "object",
+      "required": ["vulnerable"],
+      "properties": {
+        "vulnerable": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{40}$"
+        },
+        "candidate_patch": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{40}$"
+        }
+      }
+    },
+    "epistemic_tier": {
+      "type": "string",
+      "enum": [
+        "CONFIRMED_REPRODUCED",
+        "SYMBOLICALLY_SATISFIABLE",
+        "STATICALLY_TAINTED",
+        "HEURISTIC_HYPOTHESIS",
+        "VERIFIED_MITIGATION",
+        "INCONCLUSIVE"
+      ]
+    },
+    "reproduction_witness": {
+      "type": "object",
+      "required": [
+        "deterministic",
+        "successful_runs",
+        "total_attempted_runs",
+        "input_artifact_hash",
+        "fault_signal_or_oracle"
+      ],
+      "properties": {
+        "deterministic": {
+          "type": "boolean"
+        },
+        "successful_runs": {
+          "type": "integer"
+        },
+        "total_attempted_runs": {
+          "type": "integer"
+        },
+        "input_artifact_hash": {
+          "type": "string"
+        },
+        "fault_signal_or_oracle": {
+          "type": "string"
+        },
+        "stack_trace_hash": {
+          "type": "string"
+        }
+      }
+    },
+    "differential_verification": {
+      "type": "object",
+      "properties": {
+        "original_reproducer_on_patch": {
+          "type": "string",
+          "enum": ["PASSED_MITIGATED", "FAILED_STILL_VULNERABLE", "SKIPPED"]
+        },
+        "regression_suite_status": {
+          "type": "string",
+          "enum": ["ALL_PASSED", "REGRESSIONS_DETECTED", "SKIPPED"]
+        },
+        "mutation_fuzzing_bypasses_found": {
+          "type": "integer"
+        },
+        "mutation_iterations_completed": {
+          "type": "integer"
+        }
+      }
+    },
+    "cas_hashes": {
+      "type": "object",
+      "required": ["merkle_root_hash", "hash_algorithm"],
+      "properties": {
+        "hash_algorithm": {
+          "type": "string",
+          "enum": ["BLAKE3", "SHA256"]
+        },
+        "merkle_root_hash": {
+          "type": "string"
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "digest"],
+            "properties": {
+              "path": { "type": "string" },
+              "digest": { "type": "string" },
+              "size_bytes": { "type": "integer" }
+            }
+          }
+        }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "required": ["signature_algorithm", "key_id", "signature"],
+      "properties": {
+        "signature_algorithm": {
+          "type": "string",
+          "enum": ["Ed25519", "SigstoreCosignRekor"]
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
