@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Nonce-isolated AI research assistant with deterministic sandbox gating and BLAKE3 audit logs."
 
 [dependencies]
 proofline-core = { path = "../proofline-core" }

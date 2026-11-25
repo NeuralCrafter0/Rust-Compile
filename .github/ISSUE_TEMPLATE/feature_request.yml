@@ -1,0 +1,26 @@
+name: Feature / Research Proposal
+description: Propose a new analysis pass, Tree-sitter query improvement, sandbox capability, or benchmark suite
+title: "[Proposal]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation & Security Rationale
+      description: What epistemic gap, language boundary, or verification challenge does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed Architecture & Trust Boundaries
+      description: Describe crate boundaries, failure modes (fail-closed behavior), and determinism requirements.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Acceptance Criteria & Adversarial Tests
+      description: How will soundness, isolation, or precision/recall be empirically evaluated?
+    validations:
+      required: true

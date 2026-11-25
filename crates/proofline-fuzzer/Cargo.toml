@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Sanitizer crash oracle, N-run deterministic reproducer synthesizer, and mutation fuzzer for Proofline."
 
 [dependencies]
 proofline-core = { path = "../proofline-core" }

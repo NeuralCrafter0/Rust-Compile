@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Ed25519 DSSE in-toto attestations, deterministic USTAR CAS Evidence Bundles, SARIF, and CycloneDX SBOMs."
 
 [dependencies]
 proofline-core = { path = "../proofline-core" }

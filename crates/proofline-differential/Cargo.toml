@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Dual-branch V_vuln vs V_patch verification, bypass mutator, and regression checking for Proofline."
 
 [dependencies]
 proofline-core = { path = "../proofline-core" }

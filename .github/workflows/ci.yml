@@ -10,19 +10,41 @@ permissions:
   contents: read
 
 jobs:
-  workspace-tests:
-    name: Build, Test & Benchmark (Alpine musl)
+  alpine-musl-ci:
+    name: Build, Test & Z3 Verification (Alpine musl)
     runs-on: ubuntu-latest
     container:
       image: docker.io/library/rust:alpine
     steps:
       - uses: actions/checkout@v4
+      - name: Install Z3 solver for live SMT verification
+        run: apk add --no-cache z3
+      - name: Check all targets without warnings
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check --workspace --all-targets --locked
       - name: Run full workspace unit, integration, and benchmark suites
         run: cargo test --workspace --locked
-      - name: Build release CLI binary
-        run: cargo build --release -p proofline-cli --locked
-      - name: Verify CLI help & static inspection smoke test
+      - name: Build release workspace binaries
+        run: cargo build --release --workspace --locked
+      - name: Verify CLI safety boundaries and Z3 analysis smoke checks
         run: |
           ./target/release/proofline --help
+          ./target/release/proofline-guest-agent --help
           ./target/release/proofline inspect ./tests/adversarial-repos/malicious-makefile --json
           test ! -f /tmp/proofline_compromised_marker
+          ./target/release/proofline analyze ./tests/adversarial-repos/prompt-injection/vuln.c --json
+          ./target/release/proofline analyze-repo ./tests/integration/cve-sim --json
+          ./target/release/proofline verify-contract --contract ./tests/integration/sample-contract.json
+
+  ubuntu-glibc-ci:
+    name: Cross-Toolchain Build & Tests (Ubuntu glibc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native C/SMT toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang z3
+      - name: Run full workspace tests on glibc Linux
+        run: cargo test --workspace --locked

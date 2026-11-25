@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Air-gapped Firecracker KVM microVM and hardened rootless Podman execution runners for Proofline."
 
 [[bin]]
 name = "proofline-guest-agent"

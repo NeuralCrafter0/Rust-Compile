@@ -1,0 +1,52 @@
+name: Bug Report
+description: Report a bug, false positive/negative, isolation issue, or verification discrepancy in Proofline
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping harden Project Proofline.
+        For unpatched **security vulnerabilities** in Proofline itself, please follow [SECURITY.md](../../SECURITY.md) instead of filing a public issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem Description
+      description: Concise summary of the incorrect behavior or crash.
+    validations:
+      required: true
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Impacted Subsystem / Crate
+      options:
+        - proofline-cli
+        - proofline-core
+        - proofline-intelligence
+        - proofline-sandbox
+        - proofline-cpg
+        - proofline-analysis
+        - proofline-fuzzer
+        - proofline-differential
+        - proofline-supplychain
+        - proofline-ai
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal Deterministic Reproducer
+      description: Commands, source snippet, VerificationContract, or Evidence Bundle details.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: |
+        - OS & Kernel:
+        - Sandbox backend (Podman / Firecracker KVM):
+        - Toolchain (`cargo --version`, `clang --version`, `z3 --version`):
+    validations:
+      required: true

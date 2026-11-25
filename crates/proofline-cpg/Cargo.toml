@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Multi-language Tree-sitter Code Property Graph builders and cross-file call linking for Proofline."
 
 [dependencies]
 proofline-core = { path = "../proofline-core" }

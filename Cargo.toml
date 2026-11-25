@@ -18,6 +18,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Proofline Engineering Team <architect@proofline.dev>"]
 license = "Apache-2.0"
+repository = "https://github.com/NeuralCrafter0/Rust-Compile"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
