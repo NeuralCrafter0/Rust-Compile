@@ -299,13 +299,17 @@ impl SandboxRunner for PodmanSandboxRunner {
     }
 }
 
-/// Firecracker MicroVM JSON configuration builder.
+/// Firecracker MicroVM JSON configuration builder (`--config-file` schema).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirecrackerVmConfig {
+    #[serde(rename = "boot-source")]
     pub boot_source: FirecrackerBootSource,
     pub drives: Vec<FirecrackerDrive>,
+    #[serde(rename = "machine-config")]
     pub machine_config: FirecrackerMachineConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock: Option<FirecrackerVsock>,
+    #[serde(rename = "network-interfaces")]
     pub network_interfaces: Vec<serde_json::Value>,
 }
 
@@ -349,7 +353,7 @@ impl FirecrackerVmConfig {
         Self {
             boot_source: FirecrackerBootSource {
                 kernel_image_path: kernel_path.into(),
-                boot_args: "console=ttyS0 reboot=k panic=1 pci=off quiet".to_string(),
+                boot_args: "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/init quiet".to_string(),
             },
             drives: vec![FirecrackerDrive {
                 drive_id: "rootfs".to_string(),
@@ -423,13 +427,8 @@ pub fn read_vsock_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -
     Ok(serde_json::from_slice(&buf)?)
 }
 
-/// Executes Firecracker's host-initiated vsock handshake (`CONNECT <port>\n` -> `OK <port>\n`)
-/// and exchanges a framed `ExecutionConfig` -> `ExecutionOutput`.
-pub fn run_firecracker_vsock_client<S: Read + Write>(
-    stream: &mut S,
-    port: u32,
-    config: &ExecutionConfig,
-) -> Result<ExecutionOutput> {
+/// Sends Firecracker's host-initiated vsock handshake (`CONNECT <port>\n`) and verifies `OK <port>\n`.
+pub fn handshake_firecracker_vsock<S: Read + Write>(stream: &mut S, port: u32) -> Result<()> {
     let connect_line = format!("CONNECT {}\n", port);
     stream
         .write_all(connect_line.as_bytes())
@@ -457,6 +456,17 @@ pub fn run_firecracker_vsock_client<S: Read + Write>(
             ack_str
         )));
     }
+    Ok(())
+}
+
+/// Executes Firecracker's host-initiated vsock handshake (`CONNECT <port>\n` -> `OK <port>\n`)
+/// and exchanges a framed `ExecutionConfig` -> `ExecutionOutput`.
+pub fn run_firecracker_vsock_client<S: Read + Write>(
+    stream: &mut S,
+    port: u32,
+    config: &ExecutionConfig,
+) -> Result<ExecutionOutput> {
+    handshake_firecracker_vsock(stream, port)?;
 
     let framed_req = encode_vsock_frame(config)?;
     stream.write_all(&framed_req).map_err(ProoflineError::Io)?;
@@ -522,6 +532,9 @@ impl FirecrackerSandboxRunner {
 
 impl SandboxRunner for FirecrackerSandboxRunner {
     fn execute(&self, config: &ExecutionConfig) -> Result<ExecutionOutput> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FC_SEQ: AtomicU64 = AtomicU64::new(0);
+
         self.probe_environment()?;
         if config.network_policy == NetworkPolicy::HermeticProxyOnly {
             return Err(ProoflineError::IsolationViolation(
@@ -534,7 +547,9 @@ impl SandboxRunner for FirecrackerSandboxRunner {
             ));
         }
 
-        let tmp = std::env::temp_dir().join(format!("proofline-fc-{}", std::process::id()));
+        let seq = FC_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("proofline-fc-{}-{}", std::process::id(), seq));
+        let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).map_err(ProoflineError::Io)?;
         let vsock_path = tmp.join("vsock.sock");
         let cfg_path = tmp.join("vm_config.json");
@@ -563,15 +578,27 @@ impl SandboxRunner for FirecrackerSandboxRunner {
             let start = Instant::now();
             let deadline = start + Duration::from_millis(config.timeout_ms);
             let mut stream = loop {
-                if let Ok(s) = UnixStream::connect(&vsock_path) {
-                    break s;
-                }
                 if let Some(status) = child.try_wait().map_err(ProoflineError::Io)? {
+                    let err_tail = child
+                        .stderr
+                        .take()
+                        .and_then(|r| read_bounded_pipe(r, 4096).ok())
+                        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+                        .unwrap_or_default();
                     let _ = std::fs::remove_dir_all(&tmp);
                     return Err(ProoflineError::IsolationViolation(format!(
-                        "Firecracker exited prematurely with status {} before vsock ready",
-                        status
+                        "Firecracker exited prematurely with status {} before vsock ready: {}",
+                        status, err_tail
                     )));
+                }
+                if let Ok(mut candidate) = UnixStream::connect(&vsock_path) {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let step_timeout = remaining.min(Duration::from_millis(500)).max(Duration::from_millis(50));
+                    let _ = candidate.set_read_timeout(Some(step_timeout));
+                    let _ = candidate.set_write_timeout(Some(step_timeout));
+                    if handshake_firecracker_vsock(&mut candidate, DEFAULT_VSOCK_PORT).is_ok() {
+                        break candidate;
+                    }
                 }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -581,12 +608,20 @@ impl SandboxRunner for FirecrackerSandboxRunner {
                         "Firecracker microVM boot timed out waiting for virtio-vsock".to_string(),
                     ));
                 }
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(15));
             };
 
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)));
-            let result = run_firecracker_vsock_client(&mut stream, DEFAULT_VSOCK_PORT, config);
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(50));
+            let _ = stream.set_read_timeout(Some(remaining));
+            let _ = stream.set_write_timeout(Some(remaining));
+            let result = (|| -> Result<ExecutionOutput> {
+                let framed_req = encode_vsock_frame(config)?;
+                stream.write_all(&framed_req).map_err(ProoflineError::Io)?;
+                stream.flush().map_err(ProoflineError::Io)?;
+                read_vsock_frame(&mut stream)
+            })();
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&tmp);
@@ -739,6 +774,12 @@ mod tests {
         assert!(config.network_interfaces.is_empty());
         assert_eq!(config.machine_config.vcpu_count, 2);
         assert!(config.drives[0].is_read_only);
+
+        let serialized = serde_json::to_value(&config).expect("serialize FirecrackerVmConfig");
+        assert!(serialized.get("boot-source").is_some());
+        assert!(serialized.get("machine-config").is_some());
+        assert!(serialized.get("network-interfaces").is_some());
+        assert!(serialized.get("boot_source").is_none());
     }
 
     #[test]

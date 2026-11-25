@@ -13,7 +13,7 @@ For the full threat model, trust boundaries, epistemic tiers, and design specifi
 | `proofline-core` | Epistemic confidence tiers (`EpistemicTier`), `VerificationContract`, `EvidenceBundle`, error types, ANSI trace sanitization |
 | `proofline-intelligence` | Zero-trust repository ingestion, symlink-traversal & resource-limit defenses, manifest inspection, content-bound BLAKE3 root hashing |
 | `proofline-sandbox` | Isolated execution via rootless `PodmanSandboxRunner`, `FirecrackerSandboxRunner` (`/dev/kvm` + `virtio-vsock`), `proofline-guest-agent`, and `AdaptiveSandboxRunner` |
-| `proofline-cpg` | Multi-file interprocedural `CodePropertyGraph` builder (`ProjectCpgBuilder`) for C, Python, Rust, JS/TS, Go, and Java |
+| `proofline-cpg` | Multi-file interprocedural `CodePropertyGraph` builder (`ProjectCpgBuilder`) with Tree-sitter AST frontends for C, Python, and Rust, plus JS/TS, Go, and Java frontends |
 | `proofline-analysis` | Interprocedural dataflow reachability, `ExploitabilityEvaluator`, SMT-LIB2 + bounded native / `z3` solving (`SmtSolverBackend`) |
 | `proofline-fuzzer` | `CrashOracle`, N-run determinism (`ReproducerSynthesizer`), `MutationFuzzer`, and `SanitizedBuildPipeline` |
 | `proofline-differential` | Dual-branch `V_vuln` vs `V_patch` verification, `AdversarialMutator` bypass discovery, and golden regression invariance checks |
@@ -34,7 +34,7 @@ podman run --rm \
   cargo test --workspace --offline
 ```
 
-Otherwise, standard `cargo test --workspace` and `cargo build --release -p proofline-cli` work directly. For an all-in-one sandbox image bundling `clang`, ASan/UBSan (`compiler-rt`), `gcc`, `python3`, and `z3`, see [scripts/Containerfile.sandbox](scripts/Containerfile.sandbox).
+Otherwise, standard `cargo test --workspace` and `cargo build --release -p proofline-cli` work directly. For an all-in-one sandbox image bundling `clang`, ASan/UBSan (`compiler-rt`), `gcc`, `python3`, and `z3`, see [scripts/Containerfile.sandbox](scripts/Containerfile.sandbox). To provision an air-gapped Alpine `ext4` Firecracker guest rootfs containing `/sbin/init` and `proofline-guest-agent` for `/dev/kvm`, run `./scripts/build-guest-rootfs.sh`. See [Benchmarking Methodology](docs/evaluation/benchmarking-methodology.md) for controlled corpus metrics, live Firecracker KVM results, `Z3 4.13.0` runs, and real upstream `DaveGamble/cJSON` CVE evaluations.
 
 ## CLI Quickstart
 
