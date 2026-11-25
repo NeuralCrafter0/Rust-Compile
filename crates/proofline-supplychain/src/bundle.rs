@@ -188,7 +188,16 @@ impl EvidenceBundlePackager {
         signer: &AttestationSigner,
         out_dir: &Path,
     ) -> Result<BundleManifest> {
-        let (files, manifest) = Self::build_bundle_files(input, signer)?;
+        Self::package_to_dir_with_assets(input, signer, out_dir, &BTreeMap::new())
+    }
+
+    pub fn package_to_dir_with_assets(
+        input: &EvidenceBundleInput,
+        signer: &AttestationSigner,
+        out_dir: &Path,
+        extra_harness_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<BundleManifest> {
+        let (files, manifest) = Self::build_bundle_files(input, signer, extra_harness_files)?;
         fs::create_dir_all(out_dir).map_err(ProoflineError::Io)?;
         for (rel_path, bytes) in files {
             validate_archive_rel_path(&rel_path)?;
@@ -198,7 +207,7 @@ impl EvidenceBundlePackager {
             }
             fs::write(&full, &bytes).map_err(ProoflineError::Io)?;
             #[cfg(unix)]
-            if rel_path.ends_with(".sh") {
+            if rel_path.ends_with(".sh") || rel_path.starts_with("harness/bin/") {
                 use std::os::unix::fs::PermissionsExt as _;
                 let mut perms = fs::metadata(&full)?.permissions();
                 perms.set_mode(0o755);
@@ -214,7 +223,16 @@ impl EvidenceBundlePackager {
         signer: &AttestationSigner,
         dest_tar: &Path,
     ) -> Result<BundleManifest> {
-        let (files, manifest) = Self::build_bundle_files(input, signer)?;
+        Self::package_to_tar_with_assets(input, signer, dest_tar, &BTreeMap::new())
+    }
+
+    pub fn package_to_tar_with_assets(
+        input: &EvidenceBundleInput,
+        signer: &AttestationSigner,
+        dest_tar: &Path,
+        extra_harness_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<BundleManifest> {
+        let (files, manifest) = Self::build_bundle_files(input, signer, extra_harness_files)?;
         if let Some(parent) = dest_tar.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(ProoflineError::Io)?;
@@ -227,6 +245,7 @@ impl EvidenceBundlePackager {
     fn build_bundle_files(
         input: &EvidenceBundleInput,
         signer: &AttestationSigner,
+        extra_harness_files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<(BTreeMap<String, Vec<u8>>, BundleManifest)> {
         let now = Utc::now();
         let bundle_id = format!(
@@ -276,6 +295,10 @@ impl EvidenceBundlePackager {
             "harness/reproducer.bin".to_string(),
             input.reproducer_bytes.clone(),
         );
+        for (rel, bytes) in extra_harness_files {
+            validate_archive_rel_path(rel)?;
+            files.insert(rel.clone(), bytes.clone());
+        }
         files.insert(
             "traces/execution.log".to_string(),
             sanitize_terminal_trace(&input.execution_log).into_bytes(),

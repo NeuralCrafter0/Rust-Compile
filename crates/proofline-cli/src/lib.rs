@@ -117,14 +117,14 @@ pub fn analyze_source_file(
         SourceLang::Go => GoSourceParser::parse_snippet(&source, &file_name)?,
         SourceLang::Java => JavaSourceParser::parse_snippet(&source, &file_name)?,
     };
-    let traces = TaintAnalysisEngine::analyze(&cpg);
+    let traces = TaintAnalysisEngine::analyze_with_smt(&cpg, 1_500);
     let sarif = SarifExporter::from_reachability_traces(&file_name, &traces);
     Ok((traces, sarif))
 }
 
 pub fn analyze_repository(repo_dir: &Path) -> Result<(Vec<ReachabilityTrace>, SarifLog)> {
     let cpg = ProjectCpgBuilder::build_from_directory(repo_dir)?;
-    let traces = TaintAnalysisEngine::analyze(&cpg);
+    let traces = TaintAnalysisEngine::analyze_with_smt(&cpg, 1_500);
     let uri = format!("file://{}", repo_dir.display());
     let sarif = SarifExporter::from_reachability_traces(&uri, &traces);
     Ok((traces, sarif))
@@ -190,6 +190,16 @@ pub fn verify_patch_pipeline<RV: SandboxRunner, RP: SandboxRunner>(
     )?;
     let _ = &mut patch_adapter;
 
+    let replay_cmd = if report.final_epistemic_tier == EpistemicTier::VerifiedMitigation
+        && !args.patch_command.is_empty()
+    {
+        args.patch_command
+    } else {
+        args.vuln_command
+    };
+    let (run_script, extra_harness_files) =
+        collect_self_contained_harness(args.working_dir, replay_cmd);
+
     let bundle_input = EvidenceBundleInput {
         contract: args.contract.clone(),
         epistemic_tier: report.final_epistemic_tier,
@@ -200,7 +210,7 @@ pub fn verify_patch_pipeline<RV: SandboxRunner, RP: SandboxRunner>(
         reproducer_bytes: args.reproducer_bytes.to_vec(),
         build_script: "#!/bin/sh\nset -eu\n# Hermetic build recorded by Proofline CLI\n"
             .to_string(),
-        run_script: format!("#!/bin/sh\nset -eu\nexec {}\n", args.vuln_command.join(" ")),
+        run_script,
         execution_log: format!(
             "V_vuln fault={} deterministic={}/{}; V_patch mitigated={} bypasses={} regressions={}\n",
             crash_sig.fault_type,
@@ -231,9 +241,19 @@ pub fn verify_patch_pipeline<RV: SandboxRunner, RP: SandboxRunner>(
     let manifest = match (bundle_out, signer) {
         (Some(out_path), Some(s)) => {
             let m = if out_path.extension().and_then(|e| e.to_str()) == Some("tar") {
-                EvidenceBundlePackager::package_to_tar(&bundle_input, s, out_path)?
+                EvidenceBundlePackager::package_to_tar_with_assets(
+                    &bundle_input,
+                    s,
+                    out_path,
+                    &extra_harness_files,
+                )?
             } else {
-                EvidenceBundlePackager::package_to_dir(&bundle_input, s, out_path)?
+                EvidenceBundlePackager::package_to_dir_with_assets(
+                    &bundle_input,
+                    s,
+                    out_path,
+                    &extra_harness_files,
+                )?
             };
             Some(m)
         }
@@ -325,4 +345,84 @@ pub fn verify_and_replay_bundle<R: SandboxRunner>(
 ) -> Result<(VerifiedBundleReport, ReplayVerificationReport)> {
     let verifier = AttestationVerifier::from_key_file(pubkey_path)?;
     EvidenceBundleVerifier::verify_and_replay(bundle_path, &verifier, runner, command_override)
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// If `command[0]` references a bounded local executable under `working_dir`, embeds it under
+/// `harness/bin/<name>` so `verify-bundle --replay` runs self-contained without host `--workdir`.
+fn collect_self_contained_harness(
+    working_dir: &Path,
+    command: &[String],
+) -> (String, std::collections::BTreeMap<String, Vec<u8>>) {
+    const MAX_EMBEDDED_BIN_BYTES: usize = 16 * 1024 * 1024;
+    let mut assets = std::collections::BTreeMap::new();
+    let fallback_cmd = command
+        .iter()
+        .map(|s| shell_quote(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fallback_script = format!("#!/bin/sh\nset -eu\nexec {}\n", fallback_cmd);
+
+    let Some(first) = command.first() else {
+        return (fallback_script, assets);
+    };
+    let rel = first
+        .strip_prefix("/workspace/")
+        .or_else(|| first.strip_prefix("./"))
+        .unwrap_or(first);
+    if rel.starts_with('/') || rel.contains("..") || rel.contains('\0') {
+        return (fallback_script, assets);
+    }
+
+    let Ok(canon_wd) = working_dir.canonicalize() else {
+        return (fallback_script, assets);
+    };
+    let candidate = canon_wd.join(rel);
+    let Ok(meta) = fs::symlink_metadata(&candidate) else {
+        return (fallback_script, assets);
+    };
+    if meta.file_type().is_symlink()
+        || !meta.is_file()
+        || meta.len() as usize > MAX_EMBEDDED_BIN_BYTES
+    {
+        return (fallback_script, assets);
+    }
+    let Ok(canon_bin) = candidate.canonicalize() else {
+        return (fallback_script, assets);
+    };
+    if !canon_bin.starts_with(&canon_wd) {
+        return (fallback_script, assets);
+    }
+    let Ok(bytes) = fs::read(&canon_bin) else {
+        return (fallback_script, assets);
+    };
+
+    let raw_name = Path::new(rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("target");
+    let safe_name: String = raw_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    if safe_name.is_empty() {
+        return (fallback_script, assets);
+    }
+
+    let bundle_rel = format!("harness/bin/{}", safe_name);
+    assets.insert(bundle_rel.clone(), bytes);
+
+    let mut args_joined = String::new();
+    for arg in &command[1..] {
+        args_joined.push(' ');
+        args_joined.push_str(&shell_quote(arg));
+    }
+    let script = format!(
+        "#!/bin/sh\nset -eu\nchmod +x ./{0} 2>/dev/null || true\nexec ./{0}{1}\n",
+        bundle_rel, args_joined
+    );
+    (script, assets)
 }

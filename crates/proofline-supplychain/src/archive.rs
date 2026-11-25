@@ -214,6 +214,12 @@ pub fn extract_entries_safely(entries: &BTreeMap<String, Vec<u8>>, dest_dir: &Pa
             }
         }
         fs::write(&target, bytes).map_err(ProoflineError::Io)?;
+        #[cfg(unix)]
+        if rel_path.ends_with(".sh") || rel_path.starts_with("harness/bin/") {
+            use std::os::unix::fs::PermissionsExt as _;
+            let perms = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&target, perms).map_err(ProoflineError::Io)?;
+        }
     }
 
     Ok(())
@@ -228,7 +234,7 @@ fn build_ustar_header(rel_path: &str, size: u64) -> Result<[u8; BLOCK_SIZE]> {
         header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
     }
 
-    let mode = if rel_path.ends_with(".sh") {
+    let mode = if rel_path.ends_with(".sh") || rel_path.starts_with("harness/bin/") {
         b"0000755\0"
     } else {
         b"0000644\0"

@@ -31,8 +31,37 @@ pub fn verify_airgapped_guest_network() -> Result<()> {
     Ok(())
 }
 
+struct StagedDirGuard(std::path::PathBuf);
+impl Drop for StagedDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn validate_safe_rel_path(rel: &str) -> Result<()> {
+    if rel.is_empty() || rel.starts_with('/') || rel.contains('\0') || rel.contains('\\') {
+        return Err(ProoflineError::IsolationViolation(format!(
+            "Unsafe staged workspace path rejected: {:?}",
+            rel
+        )));
+    }
+    for comp in Path::new(rel).components() {
+        if !matches!(comp, std::path::Component::Normal(_)) {
+            return Err(ProoflineError::IsolationViolation(format!(
+                "Disallowed path component in staged workspace: {:?}",
+                rel
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Executes a single `ExecutionConfig` inside the guest boundary with strict timeouts and sanitization.
 pub fn execute_guest_request(config: &ExecutionConfig) -> Result<ExecutionOutput> {
+    use base64::Engine as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WS_SEQ: AtomicU64 = AtomicU64::new(0);
+
     if config.network_policy == NetworkPolicy::HermeticProxyOnly {
         return Err(ProoflineError::IsolationViolation(
             "HermeticProxyOnly disallowed inside air-gapped guest agent".to_string(),
@@ -44,12 +73,73 @@ pub fn execute_guest_request(config: &ExecutionConfig) -> Result<ExecutionOutput
         ));
     }
 
-    let mut cmd = Command::new(&config.command[0]);
-    if config.command.len() > 1 {
-        cmd.args(&config.command[1..]);
+    let _ws_guard: Option<StagedDirGuard>;
+    let effective_workdir: Option<std::path::PathBuf>;
+    if !config.staged_workspace.is_empty() {
+        let seq = WS_SEQ.fetch_add(1, Ordering::Relaxed);
+        let ws_dir = std::env::temp_dir().join(format!("proofline-ws-{}-{}", std::process::id(), seq));
+        let _ = fs::remove_dir_all(&ws_dir);
+        fs::create_dir_all(&ws_dir).map_err(ProoflineError::Io)?;
+        let guard = StagedDirGuard(ws_dir.clone());
+        let canonical_ws = ws_dir.canonicalize().map_err(ProoflineError::Io)?;
+
+        for entry in &config.staged_workspace {
+            validate_safe_rel_path(&entry.rel_path)?;
+            let dest = canonical_ws.join(&entry.rel_path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(ProoflineError::Io)?;
+                let canon_parent = parent.canonicalize().map_err(ProoflineError::Io)?;
+                if !canon_parent.starts_with(&canonical_ws) {
+                    return Err(ProoflineError::IsolationViolation(format!(
+                        "Staged file escapes workspace boundary: {:?}",
+                        entry.rel_path
+                    )));
+                }
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(entry.bytes_b64.as_bytes())
+                .map_err(|e| ProoflineError::ParseFailure(format!("Invalid staged base64: {}", e)))?;
+            fs::write(&dest, &bytes).map_err(ProoflineError::Io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = if entry.executable { 0o755 } else { 0o644 };
+                fs::set_permissions(&dest, fs::Permissions::from_mode(mode))
+                    .map_err(ProoflineError::Io)?;
+            }
+        }
+        _ws_guard = Some(guard);
+        effective_workdir = Some(canonical_ws);
+    } else {
+        _ws_guard = None;
+        effective_workdir = if config.working_dir.exists() {
+            Some(config.working_dir.clone())
+        } else {
+            None
+        };
     }
-    if config.working_dir.exists() {
-        cmd.current_dir(&config.working_dir);
+
+    let map_arg = |arg: &str| -> String {
+        if let Some(ref ws) = effective_workdir {
+            if !config.staged_workspace.is_empty() {
+                if arg == "/workspace" {
+                    return ws.to_string_lossy().to_string();
+                }
+                if let Some(rel) = arg.strip_prefix("/workspace/") {
+                    return ws.join(rel).to_string_lossy().to_string();
+                }
+            }
+        }
+        arg.to_string()
+    };
+
+    let mut cmd = Command::new(map_arg(&config.command[0]));
+    if config.command.len() > 1 {
+        let mapped: Vec<String> = config.command[1..].iter().map(|a| map_arg(a)).collect();
+        cmd.args(mapped);
+    }
+    if let Some(ref wd) = effective_workdir {
+        cmd.current_dir(wd);
     }
     cmd.env_clear();
     cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");

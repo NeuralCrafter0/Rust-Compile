@@ -13,7 +13,7 @@ For the full threat model, trust boundaries, epistemic tiers, and design specifi
 | `proofline-core` | Epistemic confidence tiers (`EpistemicTier`), `VerificationContract`, `EvidenceBundle`, error types, ANSI trace sanitization |
 | `proofline-intelligence` | Zero-trust repository ingestion, symlink-traversal & resource-limit defenses, manifest inspection, content-bound BLAKE3 root hashing |
 | `proofline-sandbox` | Isolated execution via rootless `PodmanSandboxRunner`, `FirecrackerSandboxRunner` (`/dev/kvm` + `virtio-vsock`), `proofline-guest-agent`, and `AdaptiveSandboxRunner` |
-| `proofline-cpg` | Multi-file interprocedural `CodePropertyGraph` builder (`ProjectCpgBuilder`) with Tree-sitter AST frontends for C, Python, and Rust, plus JS/TS, Go, and Java frontends |
+| `proofline-cpg` | Multi-file interprocedural `CodePropertyGraph` builder (`ProjectCpgBuilder`) with Tree-sitter AST frontends across all 6 supported languages (`C`, `Python`, `Rust`, `JS/TS`, `Go`, `Java`) |
 | `proofline-analysis` | Interprocedural dataflow reachability, `ExploitabilityEvaluator`, SMT-LIB2 + bounded native / `z3` solving (`SmtSolverBackend`) |
 | `proofline-fuzzer` | `CrashOracle`, N-run determinism (`ReproducerSynthesizer`), `MutationFuzzer`, and `SanitizedBuildPipeline` |
 | `proofline-differential` | Dual-branch `V_vuln` vs `V_patch` verification, `AdversarialMutator` bypass discovery, and golden regression invariance checks |
@@ -48,19 +48,20 @@ proofline analyze ./src/handler.c --sarif report.sarif.json
 # 3. Generate an Ed25519 attestation keypair
 proofline keygen --out-dir ./keys
 
-# 4. Run isolated differential patch verification and package a signed Evidence Bundle
+# 4. Run isolated differential patch verification (add `--sandbox firecracker` or `auto` for KVM) and package a self-contained signed Evidence Bundle
 proofline verify-patch \
   --workdir ./target-repo \
   --vuln-cmd /workspace/build-vuln/app \
   --patch-cmd /workspace/build-patch/app \
   --reproducer ./poc.bin \
   --regression ./good_req.bin \
+  --sandbox auto \
   --signing-key ./keys/proofline.key.json \
   --bundle-out ./evidence.tar \
   --sarif-out ./verification.sarif.json
 
-# 5. Independently verify an Evidence Bundle on a clean machine (add --replay or --trust-policy)
-proofline verify-bundle --bundle ./evidence.tar --pubkey ./keys/proofline.pub.json
+# 5. Independently verify and replay an Evidence Bundle on a clean machine (supports `--sandbox firecracker|podman|auto` and `--trust-policy`)
+proofline verify-bundle --bundle ./evidence.tar --pubkey ./keys/proofline.pub.json --replay
 
 # 6. Fuzz-reproduce an unverified binary, validate contracts, or compare two build artifacts
 proofline reproduce --workdir ./target-repo --budget 64 --out-poc ./poc.bin -- /workspace/app

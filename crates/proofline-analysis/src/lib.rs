@@ -105,7 +105,9 @@ impl TaintAnalysisEngine {
         };
 
         let smt_formula = if status == PathVerificationStatus::UnguardedExploitableTaint {
-            Some(SmtPathConstraintGenerator::generate_formula(&sink_type))
+            Some(SmtPathConstraintGenerator::generate_formula_for_trace(
+                cpg, start, target, &sink_type,
+            ))
         } else {
             None
         };
@@ -119,6 +121,35 @@ impl TaintAnalysisEngine {
             recommended_epistemic_tier: tier,
             smt_constraint_formula: smt_formula,
         })
+    }
+
+    /// Runs taint reachability and solves extracted SMT-LIB2 path constraints via `SmtSolverBackend` (`z3` or bounded native fallback).
+    pub fn analyze_with_smt(cpg: &CodePropertyGraph, timeout_ms: u64) -> Vec<ReachabilityTrace> {
+        let mut traces = Self::analyze(cpg);
+        for trace in &mut traces {
+            if trace.status != PathVerificationStatus::UnguardedExploitableTaint {
+                continue;
+            }
+            if let Some(ref formula) = trace.smt_constraint_formula {
+                match SmtSolverBackend::solve_smt_lib2(formula, timeout_ms) {
+                    SmtSolveResult::Satisfiable {
+                        recommended_tier, ..
+                    } => {
+                        trace.recommended_epistemic_tier = recommended_tier;
+                    }
+                    SmtSolveResult::Unsatisfiable => {
+                        trace.status = PathVerificationStatus::SanitizedOrGuarded;
+                        trace.recommended_epistemic_tier = EpistemicTier::VerifiedMitigation;
+                    }
+                    SmtSolveResult::UnavailableOrTimeout {
+                        recommended_tier, ..
+                    } => {
+                        trace.recommended_epistemic_tier = recommended_tier;
+                    }
+                }
+            }
+        }
+        traces
     }
 
     fn find_dataflow_path(cpg: &CodePropertyGraph, start: NodeId, target: NodeId) -> Option<Vec<NodeId>> {
@@ -182,20 +213,53 @@ pub struct SmtPathConstraintGenerator;
 
 impl SmtPathConstraintGenerator {
     pub fn generate_formula(sink_type: &str) -> String {
+        Self::generate_cwe119_formula(64, None)
+            .filter(|_| sink_type == "CWE-119_UNBOUNDED_COPY")
+            .unwrap_or_else(|| Self::generate_non_cwe119_formula(sink_type))
+    }
+
+    /// Synthesizes an SMT-LIB2 query grounded in AST-extracted buffer sizes and ingress read bounds.
+    pub fn generate_formula_for_trace(
+        cpg: &CodePropertyGraph,
+        ingress_id: NodeId,
+        sink_id: NodeId,
+        sink_type: &str,
+    ) -> String {
+        if sink_type != "CWE-119_UNBOUNDED_COPY" {
+            return Self::generate_non_cwe119_formula(sink_type);
+        }
+
+        let sink_node = cpg.get_node(sink_id);
+        let ingress_node = cpg.get_node(ingress_id);
+        let dest_var = sink_node.and_then(|n| extract_first_call_arg_ident(&n.code_snippet));
+        let dest_cap = dest_var
+            .as_deref()
+            .and_then(|v| lookup_array_capacity(cpg, v, sink_node.map(|n| n.file_path.as_str())))
+            .unwrap_or(64);
+        let ingress_bound = ingress_node.and_then(|n| extract_ingress_read_limit(cpg, n));
+
+        Self::generate_cwe119_formula(dest_cap, ingress_bound).expect("CWE-119 formula")
+    }
+
+    fn generate_cwe119_formula(dest_capacity: u64, ingress_upper_bound: Option<u64>) -> Option<String> {
+        let mut formula = String::new();
+        formula.push_str("; SMT-LIB2 Formulated Path Condition for CWE-119 Memory Safety\n");
+        formula.push_str("(set-logic QF_BV)\n");
+        formula.push_str("(declare-const input_len (_ BitVec 64))\n");
+        formula.push_str("(declare-const dest_capacity (_ BitVec 64))\n");
+        formula.push_str(&format!("(assert (= dest_capacity (_ bv{} 64)))\n", dest_capacity));
+        if let Some(bound) = ingress_upper_bound {
+            formula.push_str(&format!("(assert (bvule input_len (_ bv{} 64)))\n", bound));
+        }
+        formula.push_str("; Fault invariant: input length exceeds destination buffer\n");
+        formula.push_str("(assert (bvugt input_len dest_capacity))\n");
+        formula.push_str("(check-sat)\n");
+        formula.push_str("(get-model)\n");
+        Some(formula)
+    }
+
+    fn generate_non_cwe119_formula(sink_type: &str) -> String {
         match sink_type {
-            "CWE-119_UNBOUNDED_COPY" => {
-                let mut formula = String::new();
-                formula.push_str("; SMT-LIB2 Formulated Path Condition for CWE-119 Memory Safety\n");
-                formula.push_str("(set-logic QF_BV)\n");
-                formula.push_str("(declare-const input_len (_ BitVec 64))\n");
-                formula.push_str("(declare-const dest_capacity (_ BitVec 64))\n");
-                formula.push_str("(assert (= dest_capacity (_ bv64 64)))\n");
-                formula.push_str("; Fault invariant: input length exceeds destination buffer\n");
-                formula.push_str("(assert (bvugt input_len dest_capacity))\n");
-                formula.push_str("(check-sat)\n");
-                formula.push_str("(get-model)\n");
-                formula
-            }
             "CWE-89_SQL_INJECTION" => {
                 let mut formula = String::new();
                 formula.push_str("; SMT-LIB2 Formulated Path Condition for CWE-89 SQL Injection\n");
@@ -228,6 +292,59 @@ impl SmtPathConstraintGenerator {
             }
         }
     }
+}
+
+fn parse_array_bracket_size(decl_text: &str) -> Option<u64> {
+    let open = decl_text.find('[')?;
+    let close = decl_text[open + 1..].find(']')?;
+    decl_text[open + 1..open + 1 + close].trim().parse::<u64>().ok()
+}
+
+fn lookup_array_capacity(cpg: &CodePropertyGraph, var_name: &str, file_hint: Option<&str>) -> Option<u64> {
+    cpg.nodes.iter().find_map(|n| match &n.kind {
+        CpgNodeKind::VariableDecl { name, var_type }
+            if name == var_name && file_hint.map(|f| f == n.file_path).unwrap_or(true) =>
+        {
+            parse_array_bracket_size(var_type)
+        }
+        _ => None,
+    })
+}
+
+fn extract_first_call_arg_ident(snippet: &str) -> Option<String> {
+    let open = snippet.find('(')?;
+    let rest = &snippet[open + 1..];
+    let first = rest.split(',').next()?.trim();
+    let ident: String = first
+        .trim_start_matches('&')
+        .trim_start_matches('*')
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() { None } else { Some(ident) }
+}
+
+fn extract_ingress_read_limit(cpg: &CodePropertyGraph, ingress: &proofline_cpg::CpgNode) -> Option<u64> {
+    let s = ingress.code_snippet.as_str();
+    let (callee, arg_idx) = if s.contains("fgets(") {
+        ("fgets(", 1)
+    } else if s.contains("read(") {
+        ("read(", 2)
+    } else if s.contains("recv(") {
+        ("recv(", 2)
+    } else {
+        return None;
+    };
+    let after = s.split(callee).nth(1)?;
+    let arg = after.split(',').nth(arg_idx)?.trim();
+    if let Ok(n) = arg.trim_end_matches(')').trim().parse::<u64>() {
+        return Some(n);
+    }
+    if let Some(inner) = arg.strip_prefix("sizeof(") {
+        let var = inner.trim_end_matches(')').trim();
+        return lookup_array_capacity(cpg, var, Some(ingress.file_path.as_str()));
+    }
+    None
 }
 
 /// Attacker authentication tier for Subsystem D Exploitability & Reachability analysis.
@@ -472,15 +589,33 @@ impl SmtSolverBackend {
 pub struct WitnessSeedSynthesizer;
 
 impl WitnessSeedSynthesizer {
-    pub fn synthesize_seed(sink_type: &str, _smt_formula: Option<&str>) -> Vec<u8> {
+    pub fn synthesize_seed(sink_type: &str, smt_formula: Option<&str>) -> Vec<u8> {
         match sink_type {
-            "CWE-119_UNBOUNDED_COPY" => vec![b'A'; 128],
+            "CWE-119_UNBOUNDED_COPY" => {
+                let cap = smt_formula
+                    .and_then(extract_formula_dest_capacity)
+                    .unwrap_or(64);
+                let len = (cap.saturating_add(16)).clamp(16, 4096) as usize;
+                vec![b'A'; len]
+            }
             "CWE-89_SQL_INJECTION" => b"' OR 1=1--".to_vec(),
             "CWE-78_COMMAND_INJECTION" => b"; id".to_vec(),
             "CWE-22_PATH_TRAVERSAL" => b"../../etc/passwd".to_vec(),
             _ => b"PROOFLINE_SEED_INPUT".to_vec(),
         }
     }
+}
+
+fn extract_formula_dest_capacity(formula: &str) -> Option<u64> {
+    for line in formula.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("(assert (= dest_capacity (_ bv") {
+            if let Some(num) = rest.split_whitespace().next() {
+                return num.parse::<u64>().ok();
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -696,5 +831,50 @@ mod tests {
         unsat_formula.push_str("(assert (bvule input_len (_ bv32 64)))\n");
         let unsat_res = SmtSolverBackend::solve_bounded_native(&unsat_formula);
         assert_eq!(unsat_res, SmtSolveResult::Unsatisfiable);
+    }
+
+    #[test]
+    fn test_ast_extracted_buffer_bounds_and_analyze_with_smt() {
+        // Case 1: dst[16] with fgets(512) -> AST extracts bv16 & bv512 -> SMT solver proves SAT & sizes seed to 32
+        let small_dst = r#"
+        int handler() {
+            char buf[256];
+            fgets(buf, 512, stdin);
+            char dst[16];
+            strcpy(dst, buf);
+            return 0;
+        }
+        "#;
+        let cpg_sat = proofline_cpg::CSourceParser::parse_snippet(small_dst, "small_dst.c").unwrap();
+        let traces_sat = TaintAnalysisEngine::analyze_with_smt(&cpg_sat, 2000);
+        assert_eq!(traces_sat.len(), 1);
+        assert_eq!(
+            traces_sat[0].recommended_epistemic_tier,
+            EpistemicTier::SymbolicallySatisfiable
+        );
+        let formula_sat = traces_sat[0].smt_constraint_formula.as_deref().unwrap();
+        assert!(formula_sat.contains("(= dest_capacity (_ bv16 64))"));
+        assert!(formula_sat.contains("(bvule input_len (_ bv512 64))"));
+        let seed = WitnessSeedSynthesizer::synthesize_seed(&traces_sat[0].sink_type, Some(formula_sat));
+        assert_eq!(seed.len(), 32);
+
+        // Case 2: buf[32] read via sizeof(buf) into dst[64] -> input_len <= 32 && input_len > 64 -> UNSAT!
+        let bounded_read = r#"
+        int safe_handler() {
+            char buf[32];
+            fgets(buf, sizeof(buf), stdin);
+            char dst[64];
+            strcpy(dst, buf);
+            return 0;
+        }
+        "#;
+        let cpg_unsat = proofline_cpg::CSourceParser::parse_snippet(bounded_read, "safe_cap.c").unwrap();
+        let traces_unsat = TaintAnalysisEngine::analyze_with_smt(&cpg_unsat, 2000);
+        assert_eq!(traces_unsat.len(), 1);
+        assert_eq!(traces_unsat[0].status, PathVerificationStatus::SanitizedOrGuarded);
+        assert_eq!(
+            traces_unsat[0].recommended_epistemic_tier,
+            EpistemicTier::VerifiedMitigation
+        );
     }
 }

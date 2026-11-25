@@ -66,4 +66,32 @@ fn test_live_firecracker_kvm_microvm_vsock_roundtrip() {
         .expect("second sequential Firecracker KVM microVM execution");
     assert_eq!(fault_out.exit_code, 42);
     assert!(fault_out.stdout.contains("ro_status=1"), "rootfs must be read-only: {}", fault_out.stdout);
+
+    // 3. Verify host -> guest workspace staging & `/workspace/...` argument mapping over vsock
+    let host_ws = std::env::temp_dir().join(format!("proofline-kvm-ws-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&host_ws);
+    std::fs::create_dir_all(&host_ws).unwrap();
+    let script_path = host_ws.join("probe.sh");
+    std::fs::write(&script_path, "#!/bin/sh\necho staged_ok:$(cat input.txt)\n").unwrap();
+    std::fs::write(host_ws.join("input.txt"), "kvm-ws-data").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut staged_cfg = ExecutionConfig::default();
+    staged_cfg.working_dir = host_ws.clone();
+    staged_cfg.timeout_ms = 10_000;
+    staged_cfg.command = vec!["/workspace/probe.sh".to_string()];
+    let staged_out = runner
+        .execute(&staged_cfg)
+        .expect("staged workspace Firecracker KVM execution");
+    let _ = std::fs::remove_dir_all(&host_ws);
+    assert_eq!(staged_out.exit_code, 0, "stderr: {}", staged_out.stderr);
+    assert!(
+        staged_out.stdout.contains("staged_ok:kvm-ws-data"),
+        "expected staged guest output, got: {}",
+        staged_out.stdout
+    );
 }

@@ -1,5 +1,6 @@
 use proofline_cpg::{
-    CSourceParser, CpgEdgeKind, CpgNodeKind, PythonSourceParser, RustSourceParser,
+    CSourceParser, CpgEdgeKind, CpgNodeKind, GoSourceParser, JavaSourceParser, JsTsSourceParser,
+    PythonSourceParser, RustSourceParser,
 };
 
 #[test]
@@ -153,4 +154,65 @@ pub fn run_worker(
         })
         .collect();
     assert_eq!(sinks, vec![("CWE-78_COMMAND_INJECTION", "cmd_arg")]);
+}
+
+#[test]
+fn test_treesitter_js_ts_go_java_multiline_and_ignores_comments() {
+    let ts_src = r#"
+/* Comment trap: execSync(fake) */
+export async function runHandler(
+    req: Request,
+    extra: string
+) {
+    const cmd = req.query.cmd;
+    // eval(cmd) in comment must be ignored
+    execSync(
+        cmd
+    );
+}
+"#;
+    let ts_cpg = JsTsSourceParser::parse_snippet(ts_src, "handler.ts").expect("TS parse");
+    assert_eq!(ts_cpg.find_ingress_nodes().len(), 1);
+    assert_eq!(ts_cpg.find_sink_nodes().len(), 1);
+
+    let go_src = r#"
+package main
+/* exec.Command("trap") in block comment */
+func RunTool(
+    r *http.Request,
+    mode string,
+) {
+    cmd := r.URL.Query().Get(
+        "cmd",
+    )
+    // db.Query(cmd) ignored
+    exec.Command(
+        cmd,
+    )
+}
+"#;
+    let go_cpg = GoSourceParser::parse_snippet(go_src, "tool.go").expect("Go parse");
+    assert_eq!(go_cpg.find_ingress_nodes().len(), 1);
+    assert_eq!(go_cpg.find_sink_nodes().len(), 1);
+
+    let java_src = r#"
+class Controller {
+    /* stmt.executeQuery(trap) in comment */
+    public void handle(
+        HttpServletRequest request,
+        Statement stmt
+    ) {
+        String id = request.getParameter(
+            "id"
+        );
+        // Runtime.getRuntime().exec(id) ignored
+        stmt.executeQuery(
+            id
+        );
+    }
+}
+"#;
+    let java_cpg = JavaSourceParser::parse_snippet(java_src, "Controller.java").expect("Java parse");
+    assert_eq!(java_cpg.find_ingress_nodes().len(), 1);
+    assert_eq!(java_cpg.find_sink_nodes().len(), 1);
 }

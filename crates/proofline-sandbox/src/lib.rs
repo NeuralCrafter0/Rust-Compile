@@ -27,6 +27,13 @@ pub enum NetworkPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedWorkspaceFile {
+    pub rel_path: String,
+    pub bytes_b64: String,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionConfig {
     pub command: Vec<String>,
     pub working_dir: PathBuf,
@@ -40,6 +47,8 @@ pub struct ExecutionConfig {
     pub read_only_workspace: bool,
     #[serde(default)]
     pub stdin_input: Option<Vec<u8>>,
+    #[serde(default)]
+    pub staged_workspace: Vec<StagedWorkspaceFile>,
 }
 
 impl Default for ExecutionConfig {
@@ -55,6 +64,7 @@ impl Default for ExecutionConfig {
             read_only_rootfs: true,
             read_only_workspace: false,
             stdin_input: None,
+            staged_workspace: Vec::new(),
         }
     }
 }
@@ -377,10 +387,14 @@ impl FirecrackerVmConfig {
     }
 }
 
+const MAX_VSOCK_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STAGED_WORKSPACE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STAGED_WORKSPACE_FILES: usize = 256;
+
 /// Framed protocol message helpers for `virtio-vsock` host <-> guest IPC (RFC-001 Boundary B2).
 pub fn encode_vsock_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(msg)?;
-    if payload.len() > MAX_CAPTURE_BYTES {
+    if payload.len() > MAX_VSOCK_FRAME_BYTES {
         return Err(ProoflineError::ResourceExhausted(
             "vsock frame exceeds maximum payload size".to_string(),
         ));
@@ -399,7 +413,7 @@ pub fn decode_vsock_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<
         ));
     }
     let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-    if len > MAX_CAPTURE_BYTES {
+    if len > MAX_VSOCK_FRAME_BYTES {
         return Err(ProoflineError::ResourceExhausted(
             "vsock frame payload length exceeds limit".to_string(),
         ));
@@ -417,7 +431,7 @@ pub fn read_vsock_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -
     let mut hdr = [0u8; 4];
     reader.read_exact(&mut hdr).map_err(ProoflineError::Io)?;
     let len = u32::from_be_bytes(hdr) as usize;
-    if len > MAX_CAPTURE_BYTES {
+    if len > MAX_VSOCK_FRAME_BYTES {
         return Err(ProoflineError::ResourceExhausted(
             "vsock frame payload length exceeds limit".to_string(),
         ));
@@ -425,6 +439,71 @@ pub fn read_vsock_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).map_err(ProoflineError::Io)?;
     Ok(serde_json::from_slice(&buf)?)
+}
+
+/// Safely collects bounded regular files from a host `working_dir` for Firecracker vsock staging.
+/// Refuses symlinks and enforces strict file-count and total-byte caps.
+pub fn stage_workspace_files(dir: &std::path::Path, max_total_bytes: usize) -> Result<Vec<StagedWorkspaceFile>> {
+    let canonical_root = dir.canonicalize().map_err(ProoflineError::Io)?;
+    let mut stack = vec![canonical_root.clone()];
+    let mut out = Vec::new();
+    let mut total_bytes = 0usize;
+
+    while let Some(cur) = stack.pop() {
+        for entry in std::fs::read_dir(&cur).map_err(ProoflineError::Io)? {
+            let entry = entry.map_err(ProoflineError::Io)?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(ProoflineError::Io)?;
+            if meta.file_type().is_symlink() {
+                return Err(ProoflineError::IsolationViolation(format!(
+                    "Symlink rejected during Firecracker workspace staging: {:?}",
+                    path
+                )));
+            }
+            let name = entry.file_name();
+            if name == ".git" || name == "target" {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if meta.is_file() {
+                if out.len() >= MAX_STAGED_WORKSPACE_FILES {
+                    return Err(ProoflineError::ResourceExhausted(
+                        "Staged Firecracker workspace exceeded maximum file count".to_string(),
+                    ));
+                }
+                let size = meta.len() as usize;
+                total_bytes = total_bytes.saturating_add(size);
+                if total_bytes > max_total_bytes {
+                    return Err(ProoflineError::ResourceExhausted(
+                        "Staged Firecracker workspace exceeded byte limit".to_string(),
+                    ));
+                }
+                let rel = path
+                    .strip_prefix(&canonical_root)
+                    .map_err(|e| ProoflineError::ParseFailure(e.to_string()))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let bytes = std::fs::read(&path).map_err(ProoflineError::Io)?;
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    meta.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = false;
+                out.push(StagedWorkspaceFile {
+                    rel_path: rel,
+                    bytes_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    executable,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(out)
 }
 
 /// Sends Firecracker's host-initiated vsock handshake (`CONNECT <port>\n`) and verifies `OK <port>\n`.
@@ -501,6 +580,27 @@ impl FirecrackerSandboxRunner {
         }
     }
 
+    /// Resolves `firecracker`, `vmlinux-6.1.102`, and `rootfs.ext4` from `dir_override`,
+    /// `PROOFLINE_FIRECRACKER_DIR`, or `$HOME/.local/share/proofline/firecracker`.
+    pub fn from_dir_or_default(dir_override: Option<&std::path::Path>) -> Self {
+        let base = dir_override
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("PROOFLINE_FIRECRACKER_DIR").map(PathBuf::from))
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/root"));
+                home.join(".local/share/proofline/firecracker")
+            });
+        Self::new(
+            base.join("firecracker"),
+            base.join("vmlinux-6.1.102"),
+            base.join("rootfs.ext4"),
+            1,
+            256,
+        )
+    }
+
     /// Fails closed unless `/dev/kvm`, the `firecracker` binary, guest kernel, and rootfs exist.
     pub fn probe_environment(&self) -> Result<()> {
         if !std::path::Path::new("/dev/kvm").exists() {
@@ -547,6 +647,16 @@ impl SandboxRunner for FirecrackerSandboxRunner {
             ));
         }
 
+        let mut effective_cfg = config.clone();
+        if effective_cfg.staged_workspace.is_empty()
+            && effective_cfg.working_dir.exists()
+            && effective_cfg.working_dir != std::path::Path::new("/tmp")
+            && effective_cfg.working_dir != std::path::Path::new("/workspace")
+        {
+            effective_cfg.staged_workspace =
+                stage_workspace_files(&effective_cfg.working_dir, MAX_STAGED_WORKSPACE_BYTES)?;
+        }
+
         let seq = FC_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!("proofline-fc-{}-{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -576,7 +686,7 @@ impl SandboxRunner for FirecrackerSandboxRunner {
         {
             use std::os::unix::net::UnixStream;
             let start = Instant::now();
-            let deadline = start + Duration::from_millis(config.timeout_ms);
+            let deadline = start + Duration::from_millis(effective_cfg.timeout_ms);
             let mut stream = loop {
                 if let Some(status) = child.try_wait().map_err(ProoflineError::Io)? {
                     let err_tail = child
@@ -617,7 +727,7 @@ impl SandboxRunner for FirecrackerSandboxRunner {
             let _ = stream.set_read_timeout(Some(remaining));
             let _ = stream.set_write_timeout(Some(remaining));
             let result = (|| -> Result<ExecutionOutput> {
-                let framed_req = encode_vsock_frame(config)?;
+                let framed_req = encode_vsock_frame(&effective_cfg)?;
                 stream.write_all(&framed_req).map_err(ProoflineError::Io)?;
                 stream.flush().map_err(ProoflineError::Io)?;
                 read_vsock_frame(&mut stream)
@@ -897,5 +1007,31 @@ mod tests {
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.stdout, "guest-ok\n");
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_stage_workspace_files_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!("proofline-stage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let bin_path = dir.join("sub/run_me");
+        std::fs::write(&bin_path, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("data.txt"), b"hello").unwrap();
+
+        let staged = stage_workspace_files(&dir, 1024 * 1024).unwrap();
+        assert_eq!(staged.len(), 2);
+        assert_eq!(staged[0].rel_path, "data.txt");
+        assert!(!staged[0].executable);
+        assert_eq!(staged[1].rel_path, "sub/run_me");
+        assert!(staged[1].executable);
+
+        symlink("/etc/passwd", dir.join("escape_link")).unwrap();
+        let err = stage_workspace_files(&dir, 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(err, Err(ProoflineError::IsolationViolation(_))));
     }
 }

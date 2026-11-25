@@ -198,4 +198,39 @@ fn test_full_end_to_end_pipeline_and_cli_binary() {
         let parsed: serde_json::Value = serde_json::from_slice(&ar_out.stdout).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 1);
     }
+
+    // 9. Self-contained harness binary embedding in verify_patch_pipeline when patch_cmd points into working_dir
+    let patch_exe = repo_dir.join("patch_bin");
+    fs::write(&patch_exe, b"#!/bin/sh\necho OK\n").unwrap();
+    let self_tar = workspace.path().join("self_contained.tar");
+    let mut self_contract = VerificationContract::default();
+    self_contract.target_repository = "https://github.com/example/demo-c-app".to_string();
+    self_contract.vulnerable_commit = "1111111111111111111111111111111111111111".to_string();
+    self_contract.candidate_patch_commit = Some("2222222222222222222222222222222222222222".to_string());
+    let self_out = verify_patch_pipeline(
+        &VulnSimRunner,
+        &PatchSimRunner,
+        PatchVerificationArgs {
+            contract: self_contract,
+            working_dir: &repo_dir,
+            vuln_command: &["/workspace/vuln_bin".to_string()],
+            patch_command: &["/workspace/patch_bin".to_string()],
+            reproducer_bytes: b"GET ../../etc/passwd HTTP/1.1",
+            regression_inputs: &[b"GET /health HTTP/1.1".to_vec()],
+            reproduction_runs: 2,
+            reachability_traces: Vec::new(),
+        },
+        Some(&signer),
+        Some(&self_tar),
+    )
+    .unwrap();
+    let self_manifest = self_out.manifest.unwrap();
+    assert!(
+        self_manifest
+            .cas_hashes
+            .artifacts
+            .iter()
+            .any(|a| a.path == "harness/bin/patch_bin"),
+        "expected self-contained binary artifact inside signed bundle"
+    );
 }

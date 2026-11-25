@@ -5,7 +5,10 @@ use proofline_cli::{
     verify_bundle, verify_patch_pipeline, PatchVerificationArgs, SourceLang,
 };
 use proofline_core::{EpistemicTier, VerificationContract};
-use proofline_sandbox::PodmanSandboxRunner;
+use proofline_sandbox::{
+    AdaptiveSandboxRunner, ExecutionConfig, ExecutionOutput, FirecrackerSandboxRunner,
+    PodmanSandboxRunner, SandboxRunner,
+};
 use proofline_supplychain::{
     AttestationSigner, EvidenceBundleVerifier, SignerTrustVerdict, TrustedIdentityPolicy,
 };
@@ -43,6 +46,50 @@ impl From<CliLang> for SourceLang {
             CliLang::Js => SourceLang::JavaScript,
             CliLang::Go => SourceLang::Go,
             CliLang::Java => SourceLang::Java,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliSandbox {
+    Podman,
+    Firecracker,
+    Auto,
+}
+
+enum ActiveSandbox {
+    Podman(PodmanSandboxRunner),
+    Firecracker(FirecrackerSandboxRunner),
+    Adaptive(AdaptiveSandboxRunner),
+}
+
+impl SandboxRunner for ActiveSandbox {
+    fn execute(&self, config: &ExecutionConfig) -> proofline_core::Result<ExecutionOutput> {
+        match self {
+            ActiveSandbox::Podman(r) => r.execute(config),
+            ActiveSandbox::Firecracker(r) => r.execute(config),
+            ActiveSandbox::Adaptive(r) => r.execute(config),
+        }
+    }
+}
+
+fn resolve_cli_sandbox(
+    choice: CliSandbox,
+    image: &str,
+    firecracker_dir: Option<&std::path::Path>,
+) -> ActiveSandbox {
+    match choice {
+        CliSandbox::Podman => ActiveSandbox::Podman(PodmanSandboxRunner::new(image)),
+        CliSandbox::Firecracker => {
+            ActiveSandbox::Firecracker(FirecrackerSandboxRunner::from_dir_or_default(firecracker_dir))
+        }
+        CliSandbox::Auto => {
+            let fc = FirecrackerSandboxRunner::from_dir_or_default(firecracker_dir);
+            let adaptive = AdaptiveSandboxRunner::new(Some(fc), image);
+            if let Some(ref warning) = adaptive.security_downgrade_warning {
+                eprintln!("{}", warning);
+            }
+            ActiveSandbox::Adaptive(adaptive)
         }
     }
 }
@@ -108,6 +155,12 @@ enum Commands {
         /// Golden regression test payload files (repeatable)
         #[arg(long)]
         regression: Vec<PathBuf>,
+        /// Isolation backend (`podman`, `firecracker`, or `auto`)
+        #[arg(long, value_enum, default_value_t = CliSandbox::Podman)]
+        sandbox: CliSandbox,
+        /// Optional Firecracker artifact directory (contains `firecracker`, `vmlinux-6.1.102`, `rootfs.ext4`)
+        #[arg(long)]
+        firecracker_dir: Option<PathBuf>,
         /// OCI image used by rootless Podman sandbox
         #[arg(long, default_value = "docker.io/library/alpine:latest")]
         image: String,
@@ -156,6 +209,12 @@ enum Commands {
         /// Optional initial seed payload file
         #[arg(long)]
         seed: Option<PathBuf>,
+        /// Isolation backend (`podman`, `firecracker`, or `auto`)
+        #[arg(long, value_enum, default_value_t = CliSandbox::Podman)]
+        sandbox: CliSandbox,
+        /// Optional Firecracker artifact directory
+        #[arg(long)]
+        firecracker_dir: Option<PathBuf>,
         /// OCI image used by rootless Podman sandbox
         #[arg(long, default_value = "docker.io/library/alpine:latest")]
         image: String,
@@ -196,6 +255,12 @@ enum Commands {
         /// Replay the attested reproducer inside an isolated sandbox
         #[arg(long)]
         replay: bool,
+        /// Isolation backend used when `--replay` is enabled (`podman`, `firecracker`, or `auto`)
+        #[arg(long, value_enum, default_value_t = CliSandbox::Podman)]
+        sandbox: CliSandbox,
+        /// Optional Firecracker artifact directory when `--replay` uses Firecracker
+        #[arg(long)]
+        firecracker_dir: Option<PathBuf>,
         /// OCI image used when `--replay` is enabled
         #[arg(long, default_value = "docker.io/library/alpine:latest")]
         image: String,
@@ -312,6 +377,8 @@ fn run(cli: Cli) -> proofline_core::Result<ExitCode> {
             patch_cmd,
             reproducer,
             regression,
+            sandbox,
+            firecracker_dir,
             image,
             contract,
             repo,
@@ -356,7 +423,7 @@ fn run(cli: Cli) -> proofline_core::Result<ExitCode> {
                 None => None,
             };
 
-            let runner = PodmanSandboxRunner::new(&image);
+            let runner = resolve_cli_sandbox(sandbox, &image, firecracker_dir.as_deref());
             let outcome = verify_patch_pipeline(
                 &runner,
                 &runner,
@@ -418,6 +485,8 @@ fn run(cli: Cli) -> proofline_core::Result<ExitCode> {
         Commands::Reproduce {
             workdir,
             seed,
+            sandbox,
+            firecracker_dir,
             image,
             budget,
             runs,
@@ -428,7 +497,7 @@ fn run(cli: Cli) -> proofline_core::Result<ExitCode> {
                 Some(p) => vec![fs::read(&p)?],
                 None => Vec::new(),
             };
-            let runner = PodmanSandboxRunner::new(&image);
+            let runner = resolve_cli_sandbox(sandbox, &image, firecracker_dir.as_deref());
             let res = reproduce_with_fuzzer(&runner, &workdir, &cmd, &seeds, budget, runs)?;
             println!(
                 "Iterations: {} | Epistemic Tier: {:?}",
@@ -475,12 +544,14 @@ fn run(cli: Cli) -> proofline_core::Result<ExitCode> {
             pubkey,
             trust_policy,
             replay,
+            sandbox,
+            firecracker_dir,
             image,
             cmd,
             replay_args,
         } => {
             if replay {
-                let runner = PodmanSandboxRunner::new(&image);
+                let runner = resolve_cli_sandbox(sandbox, &image, firecracker_dir.as_deref());
                 let override_vec = if !replay_args.is_empty() {
                     replay_args
                 } else {
