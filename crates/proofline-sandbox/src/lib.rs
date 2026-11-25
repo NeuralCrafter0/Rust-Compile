@@ -1,6 +1,8 @@
 //! Isolated Execution Infrastructure for Project Proofline.
-//! Manages hardware microVM specifications (Firecracker / KVM) and
-//! Rootless Podman container boundaries with fail-closed network policies.
+//! Manages hardware microVM specifications (Firecracker / KVM), virtio-vsock framing,
+//! the in-guest execution agent, and Rootless Podman container boundaries.
+
+pub mod guest_agent;
 
 use base64::Engine as _;
 use proofline_core::{sanitize_terminal_trace, ProoflineError, ReproductionWitness, Result};
@@ -12,8 +14,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENV_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const DEFAULT_VSOCK_PORT: u32 = 5050;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -108,7 +111,7 @@ impl PodmanSandboxRunner {
     }
 }
 
-fn read_bounded_pipe<R: Read>(mut reader: R, limit: usize) -> std::io::Result<Vec<u8>> {
+pub fn read_bounded_pipe<R: Read>(mut reader: R, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -405,6 +408,62 @@ pub fn decode_vsock_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<
     Ok(serde_json::from_slice(&frame[4..4 + len])?)
 }
 
+/// Reads an exact length-prefixed frame from a blocking stream without waiting for EOF.
+pub fn read_vsock_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> Result<T> {
+    let mut hdr = [0u8; 4];
+    reader.read_exact(&mut hdr).map_err(ProoflineError::Io)?;
+    let len = u32::from_be_bytes(hdr) as usize;
+    if len > MAX_CAPTURE_BYTES {
+        return Err(ProoflineError::ResourceExhausted(
+            "vsock frame payload length exceeds limit".to_string(),
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).map_err(ProoflineError::Io)?;
+    Ok(serde_json::from_slice(&buf)?)
+}
+
+/// Executes Firecracker's host-initiated vsock handshake (`CONNECT <port>\n` -> `OK <port>\n`)
+/// and exchanges a framed `ExecutionConfig` -> `ExecutionOutput`.
+pub fn run_firecracker_vsock_client<S: Read + Write>(
+    stream: &mut S,
+    port: u32,
+    config: &ExecutionConfig,
+) -> Result<ExecutionOutput> {
+    let connect_line = format!("CONNECT {}\n", port);
+    stream
+        .write_all(connect_line.as_bytes())
+        .map_err(ProoflineError::Io)?;
+    stream.flush().map_err(ProoflineError::Io)?;
+
+    let mut ack = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).map_err(ProoflineError::Io)?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        ack.push(byte[0]);
+        if ack.len() > 128 {
+            return Err(ProoflineError::IsolationViolation(
+                "Firecracker vsock CONNECT response exceeded maximum length".to_string(),
+            ));
+        }
+    }
+    let ack_str = String::from_utf8_lossy(&ack);
+    if !ack_str.starts_with("OK ") {
+        return Err(ProoflineError::IsolationViolation(format!(
+            "Firecracker vsock CONNECT rejected: {:?}",
+            ack_str
+        )));
+    }
+
+    let framed_req = encode_vsock_frame(config)?;
+    stream.write_all(&framed_req).map_err(ProoflineError::Io)?;
+    stream.flush().map_err(ProoflineError::Io)?;
+    read_vsock_frame(stream)
+}
+
 /// Hardware-virtualized Firecracker microVM sandbox runner using KVM + `virtio-vsock`.
 #[derive(Debug, Clone)]
 pub struct FirecrackerSandboxRunner {
@@ -527,16 +586,11 @@ impl SandboxRunner for FirecrackerSandboxRunner {
 
             let _ = stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)));
             let _ = stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)));
-            let framed_req = encode_vsock_frame(config)?;
-            stream.write_all(&framed_req).map_err(ProoflineError::Io)?;
-            // Firecracker host-initiated vsock handshake sends `CONNECT <port>\n` on guest listener;
-            // read framed ExecutionOutput response and clean up microVM immediately.
-            let mut resp_buf = Vec::new();
-            let _ = stream.read_to_end(&mut resp_buf);
+            let result = run_firecracker_vsock_client(&mut stream, DEFAULT_VSOCK_PORT, config);
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&tmp);
-            decode_vsock_frame(&resp_buf)
+            result
         }
         #[cfg(not(unix))]
         {
@@ -763,5 +817,44 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("SECURITY_ISOLATION_DOWNGRADED_WARNING"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_firecracker_vsock_handshake_and_guest_agent_roundtrip() {
+        use std::os::unix::net::UnixStream;
+
+        let (mut host_side, mut guest_bridge) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            // Simulate Firecracker's host-initiated `CONNECT <port>\n` -> `OK <port>\n` bridge
+            let mut line = Vec::new();
+            let mut b = [0u8; 1];
+            loop {
+                guest_bridge.read_exact(&mut b).unwrap();
+                if b[0] == b'\n' {
+                    break;
+                }
+                line.push(b[0]);
+            }
+            assert_eq!(String::from_utf8_lossy(&line), "CONNECT 5050");
+            guest_bridge.write_all(b"OK 10000\n").unwrap();
+            guest_bridge.flush().unwrap();
+
+            guest_agent::serve_vsock_stream(&mut guest_bridge).unwrap();
+        });
+
+        let mut cfg = ExecutionConfig::default();
+        cfg.working_dir = PathBuf::from("/tmp");
+        cfg.command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf 'guest-ok\\x1b[31m\\n'".to_string(),
+        ];
+
+        let out = run_firecracker_vsock_client(&mut host_side, DEFAULT_VSOCK_PORT, &cfg).unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout, "guest-ok\n");
+        server.join().unwrap();
     }
 }

@@ -1,0 +1,16 @@
+# Hermetic Proofline Sandbox Container Image
+# Provides native C/C++ sanitizer toolchains, Python, and Z3 for isolated analysis.
+FROM docker.io/library/alpine:3.20
+
+RUN apk add --no-cache \
+    build-base \
+    clang \
+    compiler-rt \
+    gcc \
+    musl-dev \
+    python3 \
+    z3
+
+RUN adduser -D -u 10001 proofline
+USER proofline
+WORKDIR /workspace

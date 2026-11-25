@@ -12,7 +12,7 @@ For the full threat model, trust boundaries, epistemic tiers, and design specifi
 | :--- | :--- |
 | `proofline-core` | Epistemic confidence tiers (`EpistemicTier`), `VerificationContract`, `EvidenceBundle`, error types, ANSI trace sanitization |
 | `proofline-intelligence` | Zero-trust repository ingestion, symlink-traversal & resource-limit defenses, manifest inspection, content-bound BLAKE3 root hashing |
-| `proofline-sandbox` | Isolated execution via rootless `PodmanSandboxRunner`, `FirecrackerSandboxRunner` (`/dev/kvm` + `virtio-vsock`), and `AdaptiveSandboxRunner` |
+| `proofline-sandbox` | Isolated execution via rootless `PodmanSandboxRunner`, `FirecrackerSandboxRunner` (`/dev/kvm` + `virtio-vsock`), `proofline-guest-agent`, and `AdaptiveSandboxRunner` |
 | `proofline-cpg` | Multi-file interprocedural `CodePropertyGraph` builder (`ProjectCpgBuilder`) for C, Python, Rust, JS/TS, Go, and Java |
 | `proofline-analysis` | Interprocedural dataflow reachability, `ExploitabilityEvaluator`, SMT-LIB2 + bounded native / `z3` solving (`SmtSolverBackend`) |
 | `proofline-fuzzer` | `CrashOracle`, N-run determinism (`ReproducerSynthesizer`), `MutationFuzzer`, and `SanitizedBuildPipeline` |
@@ -34,7 +34,7 @@ podman run --rm \
   cargo test --workspace --offline
 ```
 
-Otherwise, standard `cargo test --workspace` and `cargo build --release -p proofline-cli` work directly.
+Otherwise, standard `cargo test --workspace` and `cargo build --release -p proofline-cli` work directly. For an all-in-one sandbox image bundling `clang`, ASan/UBSan (`compiler-rt`), `gcc`, `python3`, and `z3`, see [scripts/Containerfile.sandbox](scripts/Containerfile.sandbox).
 
 ## CLI Quickstart
 

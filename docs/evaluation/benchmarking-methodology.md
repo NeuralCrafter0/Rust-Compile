@@ -9,8 +9,10 @@ Evaluate Proofline empirically across static reachability accuracy, deterministi
 2. **Historical Patch-Bypass Corpus (`benchmark_historical_patch_bypass_corpus`)**:
    - Evaluates detection of incomplete patches across CWE-22 (`..%2f` URL encoding, `..;/` semicolon path params), CWE-89 (`/**/` SQL comment whitespace bypass), and CWE-78 (`${IFS}` command separator bypass).
 3. **Compiled Native C Reproduction & Differential Suite (`benchmark_real_compiled_c_reproduction_and_differential_patch`)**:
-   - Compiles real C binaries (`vuln.c` vs `patch.c`) via `gcc` when available, runs N-run determinism checks (5/5 runs), and verifies differential mitigation and regression equivalence.
-4. **Adversarial & Supply-Chain Self-Tests**:
+   - Compiles real C binaries (`vuln.c` vs `patch.c` vs `naive_patch.c`) via `gcc` when available, runs N-run determinism checks (5/5 runs), and verifies differential mitigation, bypass discovery, and regression equivalence.
+4. **Six-Class Compiled CVE Patch-Verification Corpus (`crates/proofline-cli/tests/cve_corpus_eval.rs`)**:
+   - Compiles and tests CWE-22 path traversal (`../` vs `..%2f` incomplete patch bypass), CWE-120 unbounded copy, CWE-190 integer multiplication wraparound, CWE-134 format string crash + signed `.tar` Evidence Bundle replay, CWE-158 embedded raw NUL-byte payload handling, and FM-6 semantic invariant drift.
+5. **Adversarial & Supply-Chain Self-Tests**:
    - `crates/proofline-intelligence/tests/adversarial_ingestion.rs`: Hostile `Makefile`, file-count resource exhaustion, resolving/dangling symlink escapes, content-hash sensitivity.
    - `crates/proofline-ai/tests/prompt_injection_defense.rs`: XML boundary escape, unauthorized verdict rejection, tamper-evident audit chain.
    - `crates/proofline-supplychain/tests/bundle_verification.rs`: Tampered artifact, rogue file injection, wrong signer key, untrusted builder policy, tar symlink/traversal rejection, and replay verification.
