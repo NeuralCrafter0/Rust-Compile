@@ -1005,7 +1005,7 @@ mod tests {
 
         let out = run_firecracker_vsock_client(&mut host_side, DEFAULT_VSOCK_PORT, &cfg).unwrap();
         assert_eq!(out.exit_code, 0);
-        assert_eq!(out.stdout, "guest-ok\n");
+        assert_eq!(out.stdout, "guest-ok\\x1b[31m\n");
         server.join().unwrap();
     }
 
