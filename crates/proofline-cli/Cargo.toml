@@ -1,0 +1,28 @@
+[package]
+name = "proofline-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "proofline"
+path = "src/main.rs"
+
+[dependencies]
+proofline-core = { path = "../proofline-core" }
+proofline-intelligence = { path = "../proofline-intelligence" }
+proofline-sandbox = { path = "../proofline-sandbox" }
+proofline-cpg = { path = "../proofline-cpg" }
+proofline-analysis = { path = "../proofline-analysis" }
+proofline-fuzzer = { path = "../proofline-fuzzer" }
+proofline-differential = { path = "../proofline-differential" }
+proofline-supplychain = { path = "../proofline-supplychain" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

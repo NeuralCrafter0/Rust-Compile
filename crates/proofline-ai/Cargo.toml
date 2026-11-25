@@ -1,0 +1,22 @@
+[package]
+name = "proofline-ai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+proofline-core = { path = "../proofline-core" }
+proofline-sandbox = { path = "../proofline-sandbox" }
+proofline-fuzzer = { path = "../proofline-fuzzer" }
+proofline-differential = { path = "../proofline-differential" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

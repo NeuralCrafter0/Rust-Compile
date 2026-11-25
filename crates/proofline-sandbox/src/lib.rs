@@ -2,12 +2,18 @@
 //! Manages hardware microVM specifications (Firecracker / KVM) and
 //! Rootless Podman container boundaries with fail-closed network policies.
 
-use proofline_core::{ProoflineError, ReproductionWitness, Result};
+use base64::Engine as _;
+use proofline_core::{sanitize_terminal_trace, ProoflineError, ReproductionWitness, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
+
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENV_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -27,6 +33,10 @@ pub struct ExecutionConfig {
     pub cpu_limit_cores: f32,
     pub network_policy: NetworkPolicy,
     pub read_only_rootfs: bool,
+    #[serde(default)]
+    pub read_only_workspace: bool,
+    #[serde(default)]
+    pub stdin_input: Option<Vec<u8>>,
 }
 
 impl Default for ExecutionConfig {
@@ -40,8 +50,34 @@ impl Default for ExecutionConfig {
             cpu_limit_cores: 1.0,
             network_policy: NetworkPolicy::Denied,
             read_only_rootfs: true,
+            read_only_workspace: false,
+            stdin_input: None,
         }
     }
+}
+
+/// Attaches a potentially binary/NUL-containing payload safely to `ExecutionConfig`.
+/// Raw bytes go to `stdin_input` and base64 `PROOFLINE_INPUT_PAYLOAD_B64`;
+/// `PROOFLINE_INPUT_PAYLOAD` is populated only when valid UTF-8 without NUL bytes.
+pub fn attach_input_payload(config: &mut ExecutionConfig, payload: &[u8]) {
+    config.stdin_input = Some(payload.to_vec());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+    if b64.len() <= MAX_ENV_PAYLOAD_BYTES {
+        config
+            .env_vars
+            .insert("PROOFLINE_INPUT_PAYLOAD_B64".to_string(), b64);
+    }
+    if payload.len() <= MAX_ENV_PAYLOAD_BYTES {
+        if let Ok(text) = std::str::from_utf8(payload) {
+            if !text.contains('\0') {
+                config
+                    .env_vars
+                    .insert("PROOFLINE_INPUT_PAYLOAD".to_string(), text.to_string());
+                return;
+            }
+        }
+    }
+    config.env_vars.remove("PROOFLINE_INPUT_PAYLOAD");
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,25 +108,76 @@ impl PodmanSandboxRunner {
     }
 }
 
+fn read_bounded_pipe<R: Read>(mut reader: R, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(out.len());
+        if remaining > 0 {
+            let take = n.min(remaining);
+            out.extend_from_slice(&chunk[..take]);
+        }
+    }
+    Ok(out)
+}
+
 impl SandboxRunner for PodmanSandboxRunner {
     fn execute(&self, config: &ExecutionConfig) -> Result<ExecutionOutput> {
+        if self.container_image.is_empty() || self.container_image.starts_with('-') {
+            return Err(ProoflineError::IsolationViolation(
+                "Invalid container image reference".to_string(),
+            ));
+        }
+        if config.command.is_empty() {
+            return Err(ProoflineError::ContractUnmet(
+                "Execution command must not be empty".to_string(),
+            ));
+        }
+        if config.timeout_ms == 0 {
+            return Err(ProoflineError::ContractUnmet(
+                "Execution timeout_ms must be > 0".to_string(),
+            ));
+        }
+
+        // Validate and canonicalize working directory to prevent mount option injection
+        let canonical_workdir = if config.working_dir.exists() {
+            config.working_dir.canonicalize().map_err(ProoflineError::Io)?
+        } else {
+            config.working_dir.clone()
+        };
+        let host_dir = canonical_workdir.to_string_lossy();
+        if host_dir.contains(':') || host_dir.contains('\0') || host_dir.contains('\n') || host_dir.contains('\r') {
+            return Err(ProoflineError::IsolationViolation(format!(
+                "Unsafe working_dir path rejected: {:?}",
+                canonical_workdir
+            )));
+        }
+
         let mut cmd = Command::new("podman");
         cmd.arg("run").arg("--rm");
+        if config.stdin_input.is_some() {
+            cmd.arg("-i");
+        }
 
-        // Enforce network isolation
+        // Enforce network isolation (fail closed for unconfigured HermeticProxyOnly)
         match config.network_policy {
-            NetworkPolicy::Denied => {
-                cmd.arg("--network=none");
-            }
-            NetworkPolicy::IsolatedLoopback => {
+            NetworkPolicy::Denied | NetworkPolicy::IsolatedLoopback => {
                 cmd.arg("--network=none");
             }
             NetworkPolicy::HermeticProxyOnly => {
-                cmd.arg("--network=slirp4netns:allow_host_loopback=true");
+                return Err(ProoflineError::IsolationViolation(
+                    "HermeticProxyOnly requires an explicit isolated proxy endpoint; refusing host loopback exposure".to_string(),
+                ));
             }
         }
 
-        // Enforce resource quotas
+        // Enforce resource quotas & container timeout
+        let timeout_secs = ((config.timeout_ms + 999) / 1000).max(1);
+        cmd.arg(format!("--timeout={}", timeout_secs));
         cmd.arg(format!("--memory={}m", config.memory_limit_mb));
         cmd.arg(format!("--cpus={}", config.cpu_limit_cores));
         cmd.arg("--pids-limit=256");
@@ -103,38 +190,103 @@ impl SandboxRunner for PodmanSandboxRunner {
             cmd.arg("--tmpfs=/tmp:rw,noexec,nosuid,size=128m");
         }
 
-        // Set environment variables
+        // Validate and set environment variables
         for (k, v) in &config.env_vars {
+            if k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') {
+                return Err(ProoflineError::IsolationViolation(format!(
+                    "Invalid environment variable key/value rejected: {:?}",
+                    k
+                )));
+            }
             cmd.arg("-e").arg(format!("{}={}", k, v));
         }
 
-        // Bind mount working directory
-        let host_dir = config.working_dir.to_string_lossy();
-        cmd.arg("-v").arg(format!("{}:/workspace:rw", host_dir));
+        // Bind mount working directory (`z` label enables rootless Podman access on SELinux hosts)
+        let mount_mode = if config.read_only_workspace { "ro,z" } else { "rw,z" };
+        cmd.arg("-v")
+            .arg(format!("{}:/workspace:{}", host_dir, mount_mode));
         cmd.arg("-w").arg("/workspace");
 
         cmd.arg(&self.container_image);
         for c in &config.command {
+            if c.contains('\0') {
+                return Err(ProoflineError::IsolationViolation(
+                    "NUL byte rejected in command argument".to_string(),
+                ));
+            }
             cmd.arg(c);
         }
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(if config.stdin_input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
         let start = Instant::now();
-        let child = cmd.spawn().map_err(ProoflineError::Io)?;
-        let output = child
-            .wait_with_output()
-            .map_err(ProoflineError::Io)?;
+        let mut child = cmd.spawn().map_err(ProoflineError::Io)?;
+
+        if let Some(payload) = config.stdin_input.clone() {
+            if let Some(mut stdin) = child.stdin.take() {
+                thread::spawn(move || {
+                    let _ = stdin.write_all(&payload);
+                });
+            }
+        }
+
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_handle = thread::spawn(move || {
+            stdout_pipe
+                .map(|r| read_bounded_pipe(r, MAX_CAPTURE_BYTES))
+                .transpose()
+        });
+        let stderr_handle = thread::spawn(move || {
+            stderr_pipe
+                .map(|r| read_bounded_pipe(r, MAX_CAPTURE_BYTES))
+                .transpose()
+        });
+
+        let deadline = start + Duration::from_millis(config.timeout_ms);
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(ProoflineError::Io)? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                return Err(ProoflineError::ResourceExhausted(format!(
+                    "Sandbox execution exceeded wall-clock timeout of {} ms",
+                    config.timeout_ms
+                )));
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
         let duration_ms = start.elapsed().as_millis() as u64;
+        let raw_stdout = stdout_handle
+            .join()
+            .map_err(|_| ProoflineError::Io(std::io::Error::new(std::io::ErrorKind::Other, "stdout reader panicked")))?
+            .map_err(ProoflineError::Io)?
+            .unwrap_or_default();
+        let raw_stderr = stderr_handle
+            .join()
+            .map_err(|_| ProoflineError::Io(std::io::Error::new(std::io::ErrorKind::Other, "stderr reader panicked")))?
+            .map_err(ProoflineError::Io)?
+            .unwrap_or_default();
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout_blake3 = blake3::hash(&raw_stdout).to_hex().to_string();
+        let stderr_blake3 = blake3::hash(&raw_stderr).to_hex().to_string();
 
-        let stdout_blake3 = blake3::hash(output.stdout.as_slice()).to_hex().to_string();
-        let stderr_blake3 = blake3::hash(output.stderr.as_slice()).to_hex().to_string();
+        let stdout = sanitize_terminal_trace(&String::from_utf8_lossy(&raw_stdout));
+        let stderr = sanitize_terminal_trace(&String::from_utf8_lossy(&raw_stderr));
 
         Ok(ExecutionOutput {
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: status.code().unwrap_or(-1),
             stdout,
             stderr,
             duration_ms,
@@ -218,6 +370,248 @@ impl FirecrackerVmConfig {
     }
 }
 
+/// Framed protocol message helpers for `virtio-vsock` host <-> guest IPC (RFC-001 Boundary B2).
+pub fn encode_vsock_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(msg)?;
+    if payload.len() > MAX_CAPTURE_BYTES {
+        return Err(ProoflineError::ResourceExhausted(
+            "vsock frame exceeds maximum payload size".to_string(),
+        ));
+    }
+    let len = (payload.len() as u32).to_be_bytes();
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&len);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+pub fn decode_vsock_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T> {
+    if frame.len() < 4 {
+        return Err(ProoflineError::ParseFailure(
+            "Truncated vsock frame header".to_string(),
+        ));
+    }
+    let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    if len > MAX_CAPTURE_BYTES {
+        return Err(ProoflineError::ResourceExhausted(
+            "vsock frame payload length exceeds limit".to_string(),
+        ));
+    }
+    if frame.len() < 4 + len {
+        return Err(ProoflineError::ParseFailure(
+            "Incomplete vsock frame payload".to_string(),
+        ));
+    }
+    Ok(serde_json::from_slice(&frame[4..4 + len])?)
+}
+
+/// Hardware-virtualized Firecracker microVM sandbox runner using KVM + `virtio-vsock`.
+#[derive(Debug, Clone)]
+pub struct FirecrackerSandboxRunner {
+    pub firecracker_bin: PathBuf,
+    pub kernel_image_path: PathBuf,
+    pub rootfs_path: PathBuf,
+    pub vcpus: u32,
+    pub memory_mb: u32,
+}
+
+impl FirecrackerSandboxRunner {
+    pub fn new(
+        firecracker_bin: impl Into<PathBuf>,
+        kernel_image_path: impl Into<PathBuf>,
+        rootfs_path: impl Into<PathBuf>,
+        vcpus: u32,
+        memory_mb: u32,
+    ) -> Self {
+        Self {
+            firecracker_bin: firecracker_bin.into(),
+            kernel_image_path: kernel_image_path.into(),
+            rootfs_path: rootfs_path.into(),
+            vcpus,
+            memory_mb,
+        }
+    }
+
+    /// Fails closed unless `/dev/kvm`, the `firecracker` binary, guest kernel, and rootfs exist.
+    pub fn probe_environment(&self) -> Result<()> {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            return Err(ProoflineError::IsolationViolation(
+                "Hardware virtualization unavailable: /dev/kvm missing".to_string(),
+            ));
+        }
+        if !self.firecracker_bin.exists() {
+            return Err(ProoflineError::IsolationViolation(format!(
+                "Firecracker binary not found at {:?}",
+                self.firecracker_bin
+            )));
+        }
+        if !self.kernel_image_path.exists() {
+            return Err(ProoflineError::IsolationViolation(format!(
+                "Guest kernel image not found at {:?}",
+                self.kernel_image_path
+            )));
+        }
+        if !self.rootfs_path.exists() {
+            return Err(ProoflineError::IsolationViolation(format!(
+                "Guest rootfs image not found at {:?}",
+                self.rootfs_path
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl SandboxRunner for FirecrackerSandboxRunner {
+    fn execute(&self, config: &ExecutionConfig) -> Result<ExecutionOutput> {
+        self.probe_environment()?;
+        if config.network_policy == NetworkPolicy::HermeticProxyOnly {
+            return Err(ProoflineError::IsolationViolation(
+                "HermeticProxyOnly unsupported inside air-gapped Firecracker guest".to_string(),
+            ));
+        }
+        if config.command.is_empty() || config.timeout_ms == 0 {
+            return Err(ProoflineError::ContractUnmet(
+                "Invalid execution config for Firecracker microVM".to_string(),
+            ));
+        }
+
+        let tmp = std::env::temp_dir().join(format!("proofline-fc-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).map_err(ProoflineError::Io)?;
+        let vsock_path = tmp.join("vsock.sock");
+        let cfg_path = tmp.join("vm_config.json");
+
+        let vm_cfg = FirecrackerVmConfig::new_airgapped_sandbox(
+            self.kernel_image_path.to_string_lossy(),
+            self.rootfs_path.to_string_lossy(),
+            self.vcpus,
+            self.memory_mb,
+            vsock_path.to_string_lossy(),
+        );
+        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&vm_cfg)?).map_err(ProoflineError::Io)?;
+
+        let mut child = Command::new(&self.firecracker_bin)
+            .arg("--no-api")
+            .arg("--config-file")
+            .arg(&cfg_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(ProoflineError::Io)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixStream;
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(config.timeout_ms);
+            let mut stream = loop {
+                if let Ok(s) = UnixStream::connect(&vsock_path) {
+                    break s;
+                }
+                if let Some(status) = child.try_wait().map_err(ProoflineError::Io)? {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(ProoflineError::IsolationViolation(format!(
+                        "Firecracker exited prematurely with status {} before vsock ready",
+                        status
+                    )));
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(ProoflineError::ResourceExhausted(
+                        "Firecracker microVM boot timed out waiting for virtio-vsock".to_string(),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(config.timeout_ms)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(config.timeout_ms)));
+            let framed_req = encode_vsock_frame(config)?;
+            stream.write_all(&framed_req).map_err(ProoflineError::Io)?;
+            // Firecracker host-initiated vsock handshake sends `CONNECT <port>\n` on guest listener;
+            // read framed ExecutionOutput response and clean up microVM immediately.
+            let mut resp_buf = Vec::new();
+            let _ = stream.read_to_end(&mut resp_buf);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            decode_vsock_frame(&resp_buf)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(ProoflineError::IsolationViolation(
+                "Firecracker virtio-vsock requires a Unix host".to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IsolationBackend {
+    FirecrackerKvm,
+    PodmanRootlessContainer,
+}
+
+/// Contingency runner implementing RFC-001 Section 16.1: prefers Firecracker KVM microVMs
+/// and emits an explicit `SECURITY_ISOLATION_DOWNGRADED_WARNING` when falling back to rootless Podman.
+pub struct AdaptiveSandboxRunner {
+    firecracker: Option<FirecrackerSandboxRunner>,
+    podman: PodmanSandboxRunner,
+    pub selected_backend: IsolationBackend,
+    pub security_downgrade_warning: Option<String>,
+}
+
+impl AdaptiveSandboxRunner {
+    pub fn new(
+        firecracker: Option<FirecrackerSandboxRunner>,
+        podman_image: impl Into<String>,
+    ) -> Self {
+        let podman = PodmanSandboxRunner::new(podman_image);
+        match firecracker {
+            Some(fc) => match fc.probe_environment() {
+                Ok(()) => Self {
+                    firecracker: Some(fc),
+                    podman,
+                    selected_backend: IsolationBackend::FirecrackerKvm,
+                    security_downgrade_warning: None,
+                },
+                Err(reason) => Self {
+                    firecracker: None,
+                    podman,
+                    selected_backend: IsolationBackend::PodmanRootlessContainer,
+                    security_downgrade_warning: Some(format!(
+                        "SECURITY_ISOLATION_DOWNGRADED_WARNING: falling back to rootless Podman ({})",
+                        reason
+                    )),
+                },
+            },
+            None => Self {
+                firecracker: None,
+                podman,
+                selected_backend: IsolationBackend::PodmanRootlessContainer,
+                security_downgrade_warning: Some(
+                    "SECURITY_ISOLATION_DOWNGRADED_WARNING: Firecracker not configured; using rootless Podman"
+                        .to_string(),
+                ),
+            },
+        }
+    }
+}
+
+impl SandboxRunner for AdaptiveSandboxRunner {
+    fn execute(&self, config: &ExecutionConfig) -> Result<ExecutionOutput> {
+        match (&self.firecracker, &self.selected_backend) {
+            (Some(fc), IsolationBackend::FirecrackerKvm) => fc.execute(config),
+            _ => self.podman.execute(config),
+        }
+    }
+}
+
 /// N-run deterministic reproducer harness.
 pub struct DeterministicReplayVerifier;
 
@@ -291,5 +685,83 @@ mod tests {
         assert!(config.network_interfaces.is_empty());
         assert_eq!(config.machine_config.vcpu_count, 2);
         assert!(config.drives[0].is_read_only);
+    }
+
+    #[test]
+    fn test_hermetic_proxy_fails_closed_without_host_loopback_leak() {
+        let runner = PodmanSandboxRunner::new("docker.io/library/alpine:latest");
+        let mut config = ExecutionConfig::default();
+        config.network_policy = NetworkPolicy::HermeticProxyOnly;
+        config.working_dir = PathBuf::from("/tmp");
+
+        let res = runner.execute(&config);
+        assert!(matches!(res, Err(ProoflineError::IsolationViolation(_))));
+    }
+
+    #[test]
+    fn test_rejects_flag_injection_and_mount_delimiter() {
+        let bad_image_runner = PodmanSandboxRunner::new("--privileged");
+        let mut config = ExecutionConfig::default();
+        config.working_dir = PathBuf::from("/tmp");
+        assert!(matches!(
+            bad_image_runner.execute(&config),
+            Err(ProoflineError::IsolationViolation(_))
+        ));
+
+        let runner = PodmanSandboxRunner::new("docker.io/library/alpine:latest");
+        config.working_dir = PathBuf::from("/tmp/bad:mount");
+        assert!(matches!(
+            runner.execute(&config),
+            Err(ProoflineError::IsolationViolation(_))
+        ));
+    }
+
+    #[test]
+    fn test_binary_nul_payload_attaches_safely() {
+        let mut config = ExecutionConfig::default();
+        attach_input_payload(&mut config, b"\x00\xff\xfeCRASH");
+        assert_eq!(
+            config.stdin_input.as_deref(),
+            Some(b"\x00\xff\xfeCRASH".as_slice())
+        );
+        assert!(config.env_vars.contains_key("PROOFLINE_INPUT_PAYLOAD_B64"));
+        assert!(!config.env_vars.contains_key("PROOFLINE_INPUT_PAYLOAD"));
+
+        attach_input_payload(&mut config, b"GET ../../etc/passwd HTTP/1.1");
+        assert_eq!(
+            config.env_vars.get("PROOFLINE_INPUT_PAYLOAD").map(String::as_str),
+            Some("GET ../../etc/passwd HTTP/1.1")
+        );
+    }
+
+    #[test]
+    fn test_vsock_frame_and_adaptive_fallback_warning() {
+        let cfg = ExecutionConfig::default();
+        let framed = encode_vsock_frame(&cfg).unwrap();
+        let decoded: ExecutionConfig = decode_vsock_frame(&framed).unwrap();
+        assert_eq!(decoded.timeout_ms, cfg.timeout_ms);
+
+        let fc = FirecrackerSandboxRunner::new(
+            "/nonexistent/firecracker",
+            "/nonexistent/vmlinux",
+            "/nonexistent/rootfs.ext4",
+            1,
+            512,
+        );
+        assert!(matches!(
+            fc.probe_environment(),
+            Err(ProoflineError::IsolationViolation(_))
+        ));
+
+        let adaptive = AdaptiveSandboxRunner::new(Some(fc), "docker.io/library/alpine:latest");
+        assert_eq!(
+            adaptive.selected_backend,
+            IsolationBackend::PodmanRootlessContainer
+        );
+        assert!(adaptive
+            .security_downgrade_warning
+            .as_deref()
+            .unwrap()
+            .contains("SECURITY_ISOLATION_DOWNGRADED_WARNING"));
     }
 }

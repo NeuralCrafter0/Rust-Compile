@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://proofline.dev/schemas/v1/code-property-graph.schema.json",
+  "title": "ProoflineCodePropertyGraph",
+  "description": "Unified AST, CFG, and DDG intermediate representation produced by proofline-cpg.",
+  "type": "object",
+  "required": ["nodes", "edges"],
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "code_snippet", "file_path", "line_number"],
+        "properties": {
+          "id": { "type": "integer", "minimum": 0 },
+          "kind": { "type": "object" },
+          "code_snippet": { "type": "string" },
+          "file_path": { "type": "string" },
+          "line_number": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from", "to", "kind"],
+        "properties": {
+          "from": { "type": "integer", "minimum": 0 },
+          "to": { "type": "integer", "minimum": 0 },
+          "kind": {}
+        }
+      }
+    }
+  }
+}

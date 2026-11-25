@@ -94,10 +94,59 @@ pub struct VerificationContract {
     pub min_acceptable_tier: EpistemicTier,
 }
 
+/// Sanitizes untrusted terminal/process output against ANSI/CSI/OSC escape
+/// sequence injection and dangerous C0 control bytes while preserving newlines and tabs.
+pub fn sanitize_terminal_trace(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    // CSI sequence: ESC [ ... final byte in 0x40..=0x7E
+                    chars.next();
+                    while let Some(next_c) = chars.next() {
+                        if ('@'..='~').contains(&next_c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC sequence: ESC ] ... BEL or ST (ESC \)
+                    chars.next();
+                    while let Some(next_c) = chars.next() {
+                        if next_c == '\x07' {
+                            break;
+                        }
+                        if next_c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    // 2-byte ESC sequence
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if c == '\n' || c == '\r' || c == '\t' || (!c.is_control()) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 impl Default for VerificationContract {
     fn default() -> Self {
         Self {
-            contract_id: format!("PVC-{}", Uuid::new_v4().simple()),
+            contract_id: format!(
+                "PVC-{}-{}",
+                Utc::now().format("%Y"),
+                Uuid::new_v4().simple().to_string().to_uppercase()
+            ),
             target_repository: String::new(),
             vulnerable_commit: String::new(),
             candidate_patch_commit: None,
@@ -156,17 +205,17 @@ impl EvidenceBundle {
         witness: Option<ReproductionWitness>,
         differential: Option<DifferentialVerificationResult>,
     ) -> Self {
-        let bundle_id = format!("EVD-{}", Uuid::new_v4().simple());
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(bundle_id.as_bytes());
-        hasher.update(contract.contract_id.as_bytes());
-        hasher.update(contract.vulnerable_commit.as_bytes());
-        let merkle_root = hasher.finalize().to_hex().to_string();
+        let now = Utc::now();
+        let bundle_id = format!(
+            "EVD-{}-{}",
+            now.format("%Y"),
+            Uuid::new_v4().simple().to_string().to_uppercase()
+        );
 
-        Self {
+        let mut bundle = Self {
             schema_version: "1.0.0".to_string(),
             bundle_id,
-            timestamp: Utc::now(),
+            timestamp: now,
             contract_id: contract.contract_id.clone(),
             target_repository: contract.target_repository.clone(),
             vulnerable_commit: contract.vulnerable_commit.clone(),
@@ -174,7 +223,90 @@ impl EvidenceBundle {
             epistemic_tier: tier,
             reproduction_witness: witness,
             differential_result: differential,
-            merkle_root_blake3: merkle_root,
+            merkle_root_blake3: String::new(),
+        };
+        bundle.merkle_root_blake3 = bundle.compute_merkle_root();
+        bundle
+    }
+
+    /// Computes a domain-separated BLAKE3 commitment over all evidence fields.
+    pub fn compute_merkle_root(&self) -> String {
+        #[derive(Serialize)]
+        struct CanonicalBody<'a> {
+            schema_version: &'a str,
+            bundle_id: &'a str,
+            timestamp: String,
+            contract_id: &'a str,
+            target_repository: &'a str,
+            vulnerable_commit: &'a str,
+            candidate_patch_commit: &'a Option<String>,
+            epistemic_tier: EpistemicTier,
+            reproduction_witness: &'a Option<ReproductionWitness>,
+            differential_result: &'a Option<DifferentialVerificationResult>,
         }
+
+        let body = CanonicalBody {
+            schema_version: &self.schema_version,
+            bundle_id: &self.bundle_id,
+            timestamp: self.timestamp.to_rfc3339(),
+            contract_id: &self.contract_id,
+            target_repository: &self.target_repository,
+            vulnerable_commit: &self.vulnerable_commit,
+            candidate_patch_commit: &self.candidate_patch_commit,
+            epistemic_tier: self.epistemic_tier,
+            reproduction_witness: &self.reproduction_witness,
+            differential_result: &self.differential_result,
+        };
+
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"proofline.evidence_bundle.v1:");
+        hasher.update(&bytes);
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Verifies that `merkle_root_blake3` matches the canonical contents of this bundle.
+    pub fn verify_integrity(&self) -> Result<()> {
+        let expected = self.compute_merkle_root();
+        if self.merkle_root_blake3 != expected {
+            return Err(ProoflineError::CryptoError(format!(
+                "EvidenceBundle integrity check failed: expected {}, got {}",
+                expected, self.merkle_root_blake3
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_evidence_bundle_tamper_detection() {
+        let contract = VerificationContract::default();
+        assert!(contract.contract_id.starts_with("PVC-"));
+
+        let mut bundle = EvidenceBundle::new(
+            &contract,
+            EpistemicTier::ConfirmedReproduced,
+            None,
+            None,
+        );
+        assert!(bundle.bundle_id.starts_with("EVD-"));
+        assert!(bundle.verify_integrity().is_ok());
+
+        // Tamper with epistemic tier after creation
+        bundle.epistemic_tier = EpistemicTier::VerifiedMitigation;
+        assert!(matches!(
+            bundle.verify_integrity(),
+            Err(ProoflineError::CryptoError(_))
+        ));
+    }
+
+    #[test]
+    fn test_terminal_trace_sanitization() {
+        let hostile = "ok\x1b[31mRED\x1b[0m\x1b]0;pwned\x07\x00next\nline\t!";
+        assert_eq!(sanitize_terminal_trace(hostile), "okREDnext\nline\t!");
     }
 }

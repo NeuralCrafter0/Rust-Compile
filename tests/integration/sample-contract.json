@@ -1,0 +1,12 @@
+{
+  "contract_id": "PVC-2026-PATCH-MEMSAFETY",
+  "target_repository": "https://github.com/example/libcodec",
+  "vulnerable_commit": "a1b2c3d4e5f67890123456789012345678901234",
+  "candidate_patch_commit": "f6e5d4c3b2a10987654321098765432109876543",
+  "ingress_boundary": "UNTRUSTED_NETWORK_INPUT",
+  "required_reproduction_runs": 5,
+  "reproduction_threshold": 1.0,
+  "patch_bypass_fuzz_seconds": 300,
+  "regression_pass_threshold": 1.0,
+  "min_acceptable_tier": "CONFIRMED_REPRODUCED"
+}

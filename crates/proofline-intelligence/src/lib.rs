@@ -5,8 +5,9 @@
 use proofline_core::{ProoflineError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Supported project language ecosystems.
@@ -46,6 +47,10 @@ pub struct ProjectInspection {
     pub total_size_bytes: u64,
     pub manifest_dependencies: BTreeMap<String, String>,
     pub root_hash_blake3: String,
+    #[serde(default)]
+    pub detected_frameworks: Vec<String>,
+    #[serde(default)]
+    pub git_head_commit: Option<String>,
 }
 
 pub struct IngestionEngine {
@@ -91,27 +96,16 @@ impl IngestionEngine {
         let mut manifest_dependencies = BTreeMap::new();
         let mut repo_hasher = blake3::Hasher::new();
 
-        for entry in WalkDir::new(&canonical_root).follow_links(false) {
+        for entry in WalkDir::new(&canonical_root)
+            .follow_links(false)
+            .sort_by_file_name()
+        {
             let entry = entry.map_err(|e| ProoflineError::ParseFailure(e.to_string()))?;
             let path = entry.path();
 
-            // Defense against Symlink Traversal: check if target escapes root
+            // Fail-closed defense against Symlink Traversal (including dangling symlinks)
             if entry.path_is_symlink() {
-                if let Ok(target) = fs::read_link(path) {
-                    let resolved = if target.is_absolute() {
-                        target
-                    } else {
-                        path.parent().unwrap_or(Path::new("")).join(target)
-                    };
-                    if let Ok(canonical_target) = resolved.canonicalize() {
-                        if !canonical_target.starts_with(&canonical_root) {
-                            return Err(ProoflineError::IsolationViolation(format!(
-                                "Symlink traversal detected: {:?} -> {:?}",
-                                path, canonical_target
-                            )));
-                        }
-                    }
-                }
+                Self::validate_symlink_target(path, &canonical_root)?;
                 continue;
             }
 
@@ -124,9 +118,15 @@ impl IngestionEngine {
                     )));
                 }
 
-                let meta = entry.metadata().map_err(|e| {
-                    ProoflineError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                })?;
+                // Open the file once and check metadata on the open handle to prevent TOCTOU swaps
+                let file = File::open(path).map_err(ProoflineError::Io)?;
+                let meta = file.metadata().map_err(ProoflineError::Io)?;
+                if !meta.is_file() {
+                    return Err(ProoflineError::IsolationViolation(format!(
+                        "Non-regular file encountered at {:?}",
+                        path
+                    )));
+                }
                 let file_size = meta.len();
                 if file_size > self.max_file_size_bytes {
                     return Err(ProoflineError::ResourceExhausted(format!(
@@ -135,7 +135,27 @@ impl IngestionEngine {
                     )));
                 }
 
-                total_size += file_size;
+                // Stream actual content bounded by max_file_size_bytes + 1 (TOCTOU guard)
+                let mut file_hasher = blake3::Hasher::new();
+                let mut reader = file.take(self.max_file_size_bytes + 1);
+                let mut buf = [0u8; 16 * 1024];
+                let mut actual_size = 0u64;
+                loop {
+                    let n = reader.read(&mut buf).map_err(ProoflineError::Io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    actual_size += n as u64;
+                    if actual_size > self.max_file_size_bytes {
+                        return Err(ProoflineError::ResourceExhausted(format!(
+                            "File {:?} grew past maximum allowed size ({} bytes)",
+                            path, self.max_file_size_bytes
+                        )));
+                    }
+                    file_hasher.update(&buf[..n]);
+                }
+
+                total_size += actual_size;
                 if total_size > self.max_total_size_bytes {
                     return Err(ProoflineError::ResourceExhausted(format!(
                         "Repository total size exceeds limit of {} bytes",
@@ -185,14 +205,24 @@ impl IngestionEngine {
                     _ => {}
                 }
 
-                // Hash content into Merkle digest
-                repo_hasher.update(file_name.as_bytes());
-                repo_hasher.update(&file_size.to_le_bytes());
+                // Hash relative path, byte length, and full content digest into root hash
+                let rel_path = path
+                    .strip_prefix(&canonical_root)
+                    .unwrap_or(path)
+                    .to_string_lossy();
+                let rel_bytes = rel_path.as_bytes();
+                let file_digest = file_hasher.finalize();
+                repo_hasher.update(&(rel_bytes.len() as u64).to_le_bytes());
+                repo_hasher.update(rel_bytes);
+                repo_hasher.update(&actual_size.to_le_bytes());
+                repo_hasher.update(file_digest.as_bytes());
             }
         }
 
         let primary_language = detected_languages.first().copied().unwrap_or(ProjectLanguage::Unknown);
         let root_hash_blake3 = repo_hasher.finalize().to_hex().to_string();
+        let detected_frameworks = Self::detect_frameworks(&manifest_dependencies);
+        let git_head_commit = Self::read_git_head_safely(&canonical_root)?;
 
         Ok(ProjectInspection {
             primary_language,
@@ -202,7 +232,151 @@ impl IngestionEngine {
             total_size_bytes: total_size,
             manifest_dependencies,
             root_hash_blake3,
+            detected_frameworks,
+            git_head_commit,
         })
+    }
+
+    fn detect_frameworks(deps: &BTreeMap<String, String>) -> Vec<String> {
+        let mut out = Vec::new();
+        let known = [
+            ("actix-web", "ActixWeb"),
+            ("axum", "Axum"),
+            ("rocket", "Rocket"),
+            ("tokio", "Tokio"),
+            ("flask", "Flask"),
+            ("django", "Django"),
+            ("fastapi", "FastAPI"),
+            ("express", "Express"),
+            ("next", "NextJS"),
+        ];
+        for (pkg, label) in known {
+            if deps.keys().any(|k| k.eq_ignore_ascii_case(pkg)) {
+                push_unique(&mut out, label.to_string());
+            }
+        }
+        out
+    }
+
+    /// Reads `.git/HEAD` (and ref target if symbolic) strictly as plain files inside `canonical_root`
+    /// without invoking `git` subprocesses.
+    fn read_git_head_safely(canonical_root: &Path) -> Result<Option<String>> {
+        let git_dir = canonical_root.join(".git");
+        let head_path = git_dir.join("HEAD");
+        if !head_path.exists() {
+            return Ok(None);
+        }
+        let head_canon = head_path.canonicalize().map_err(ProoflineError::Io)?;
+        if !head_canon.starts_with(canonical_root) {
+            return Err(ProoflineError::IsolationViolation(
+                ".git/HEAD escapes repository root".to_string(),
+            ));
+        }
+        let head_str = fs::read_to_string(&head_canon)
+            .map_err(ProoflineError::Io)?
+            .trim()
+            .to_string();
+
+        if let Some(ref_rel) = head_str.strip_prefix("ref: ") {
+            let ref_clean = ref_rel.trim();
+            if ref_clean.is_empty()
+                || ref_clean.starts_with('/')
+                || ref_clean.contains("..")
+                || ref_clean.contains('\0')
+            {
+                return Err(ProoflineError::IsolationViolation(format!(
+                    "Unsafe symbolic git ref in .git/HEAD: {:?}",
+                    ref_clean
+                )));
+            }
+            let ref_path = git_dir.join(ref_clean);
+            if !ref_path.exists() {
+                return Ok(None);
+            }
+            let ref_canon = ref_path.canonicalize().map_err(ProoflineError::Io)?;
+            if !ref_canon.starts_with(canonical_root) {
+                return Err(ProoflineError::IsolationViolation(
+                    "Git ref target escapes repository root".to_string(),
+                ));
+            }
+            let sha = fs::read_to_string(&ref_canon)
+                .map_err(ProoflineError::Io)?
+                .trim()
+                .to_string();
+            return Ok(Some(sha));
+        }
+
+        if head_str.len() == 40 && head_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            Ok(Some(head_str))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn validate_symlink_target(symlink_path: &Path, canonical_root: &Path) -> Result<()> {
+        let target = fs::read_link(symlink_path).map_err(|e| {
+            ProoflineError::IsolationViolation(format!(
+                "Unreadable symlink detected at {:?}: {}",
+                symlink_path, e
+            ))
+        })?;
+
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            symlink_path.parent().unwrap_or(canonical_root).join(target)
+        };
+
+        // Check canonical target if it exists
+        if let Ok(canonical_target) = resolved.canonicalize() {
+            if !canonical_target.starts_with(canonical_root) {
+                return Err(ProoflineError::IsolationViolation(format!(
+                    "Symlink traversal detected: {:?} -> {:?}",
+                    symlink_path, canonical_target
+                )));
+            }
+            return Ok(());
+        }
+
+        // Dangling symlink: lexically normalize and verify deepest existing ancestor stays inside root
+        let normalized = normalize_lexical(&resolved).ok_or_else(|| {
+            ProoflineError::IsolationViolation(format!(
+                "Symlink traversal escapes root lexically: {:?}",
+                symlink_path
+            ))
+        })?;
+
+        if !normalized.starts_with(canonical_root) {
+            return Err(ProoflineError::IsolationViolation(format!(
+                "Dangling symlink traversal detected: {:?} -> {:?}",
+                symlink_path, normalized
+            )));
+        }
+
+        let mut ancestor = normalized.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if parent.exists() {
+                let canonical_parent = parent.canonicalize().map_err(|e| {
+                    ProoflineError::IsolationViolation(format!(
+                        "Failed to canonicalize symlink ancestor {:?}: {}",
+                        parent, e
+                    ))
+                })?;
+                if !canonical_parent.starts_with(canonical_root) {
+                    return Err(ProoflineError::IsolationViolation(format!(
+                        "Symlink ancestor traversal detected: {:?} -> {:?}",
+                        symlink_path, canonical_parent
+                    )));
+                }
+                return Ok(());
+            }
+            ancestor = parent;
+        }
+
+        Err(ProoflineError::IsolationViolation(format!(
+            "Symlink target outside repository boundary: {:?}",
+            symlink_path
+        )))
     }
 
     fn extract_cargo_manifest(path: &Path, deps: &mut BTreeMap<String, String>) {
@@ -210,6 +384,9 @@ impl IngestionEngine {
             let mut in_deps = false;
             for line in content.lines() {
                 let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
                 if trimmed.starts_with('[') {
                     in_deps = trimmed.starts_with("[dependencies") || trimmed.starts_with("[workspace.dependencies");
                     continue;
@@ -217,7 +394,10 @@ impl IngestionEngine {
                 if in_deps && trimmed.contains('=') {
                     let mut parts = trimmed.splitn(2, '=');
                     if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                        deps.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
+                        let key = k.trim();
+                        if !key.is_empty() && !key.starts_with('#') {
+                            deps.insert(key.to_string(), v.trim().trim_matches('"').to_string());
+                        }
                     }
                 }
             }
@@ -253,6 +433,24 @@ impl IngestionEngine {
     }
 }
 
+fn normalize_lexical(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    Some(out)
+}
+
 fn push_unique<T: PartialEq>(vec: &mut Vec<T>, item: T) {
     if !vec.contains(&item) {
         vec.push(item);
@@ -286,6 +484,25 @@ mod tests {
         assert!(inspection.build_systems.contains(&BuildSystemKind::Cargo));
         assert_eq!(inspection.total_source_files, 2);
         assert!(inspection.manifest_dependencies.contains_key("serde"));
+    }
+
+    #[test]
+    fn test_framework_detection_and_safe_git_head_read() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("requirements.txt"),
+            "flask==3.0.0\nrequests==2.32.0\n",
+        )
+        .unwrap();
+        let git_refs = dir.path().join(".git/refs/heads");
+        fs::create_dir_all(&git_refs).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let sha = "a1b2c3d4e5f67890123456789012345678901234";
+        fs::write(git_refs.join("main"), format!("{}\n", sha)).unwrap();
+
+        let inspection = IngestionEngine::default().inspect_repository(dir.path()).unwrap();
+        assert!(inspection.detected_frameworks.contains(&"Flask".to_string()));
+        assert_eq!(inspection.git_head_commit.as_deref(), Some(sha));
     }
 
     #[test]

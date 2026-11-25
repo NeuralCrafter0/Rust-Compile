@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://proofline.dev/schemas/v1/attestation-statement.schema.json",
+  "title": "ProoflineDsseInTotoAttestation",
+  "description": "DSSE v1 envelope wrapping an in-toto v1.0 Verification Statement signed with Ed25519.",
+  "type": "object",
+  "required": ["payloadType", "payload", "signatures"],
+  "properties": {
+    "payloadType": {
+      "type": "string",
+      "const": "application/vnd.in-toto+json"
+    },
+    "payload": {
+      "type": "string",
+      "description": "Base64-encoded RFC 8785 JCS canonicalized in-toto Statement v1.0 JSON."
+    },
+    "signatures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["keyid", "sig"],
+        "properties": {
+          "keyid": {
+            "type": "string",
+            "pattern": "^ed25519:[0-9a-f]{16}$"
+          },
+          "sig": {
+            "type": "string",
+            "description": "Base64-encoded 64-byte Ed25519 signature over DSSEv1 PAE."
+          }
+        }
+      }
+    }
+  }
+}

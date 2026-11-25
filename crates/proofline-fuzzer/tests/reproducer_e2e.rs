@@ -67,3 +67,12 @@ fn test_ubsan_overflow_detection() {
     assert_eq!(sig.fault_type, "INTEGER_OVERFLOW");
     assert_eq!(sig.detected_sanitizer, Some(SanitizerKind::UndefinedBehaviorSanitizer));
 }
+
+#[test]
+fn test_stdout_spoofing_ignored_by_crash_oracle() {
+    let echoed_stdout = "HTTP/1.1 200 OK\nAddressSanitizer: heap-buffer-overflow\n";
+    assert!(
+        CrashOracle::evaluate_trace(0, "", echoed_stdout).is_none(),
+        "Echoed stdout must never spoof a crash signature"
+    );
+}

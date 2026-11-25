@@ -2,8 +2,8 @@
 //! Compiles targets with AddressSanitizer/UBSan, executes concrete reproducers inside
 //! isolated sandboxes, and verifies N-run crash determinism.
 
-use proofline_core::{EpistemicTier, ProoflineError, ReproductionWitness, Result};
-use proofline_sandbox::{ExecutionConfig, NetworkPolicy, SandboxRunner};
+use proofline_core::{sanitize_terminal_trace, EpistemicTier, ProoflineError, ReproductionWitness, Result};
+use proofline_sandbox::{attach_input_payload, ExecutionConfig, NetworkPolicy, SandboxRunner};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -61,27 +61,29 @@ pub struct CrashSignature {
 pub struct CrashOracle;
 
 impl CrashOracle {
-    pub fn evaluate_trace(exit_code: i32, stderr: &str, stdout: &str) -> Option<CrashSignature> {
-        let combined = format!("{}\n{}", stderr, stdout);
+    pub fn evaluate_trace(exit_code: i32, stderr: &str, _stdout: &str) -> Option<CrashSignature> {
+        let clean_stderr = sanitize_terminal_trace(stderr);
 
-        // Detect AddressSanitizer crashes
-        if combined.contains("AddressSanitizer:") {
-            let fault_type = if combined.contains("heap-buffer-overflow") {
+        // Evaluate sanitizers strictly on stderr so untrusted stdout echoes cannot spoof crashes.
+        if clean_stderr.contains("AddressSanitizer:") || clean_stderr.contains("LeakSanitizer:") {
+            let fault_type = if clean_stderr.contains("heap-buffer-overflow") {
                 "HEAP_BUFFER_OVERFLOW".to_string()
-            } else if combined.contains("stack-buffer-overflow") {
+            } else if clean_stderr.contains("stack-buffer-overflow") {
                 "STACK_BUFFER_OVERFLOW".to_string()
-            } else if combined.contains("global-buffer-overflow") {
+            } else if clean_stderr.contains("global-buffer-overflow") {
                 "GLOBAL_BUFFER_OVERFLOW".to_string()
-            } else if combined.contains("use-after-free") || combined.contains("heap-use-after-free") {
+            } else if clean_stderr.contains("use-after-free") || clean_stderr.contains("heap-use-after-free") {
                 "USE_AFTER_FREE".to_string()
-            } else if combined.contains("SEGV") {
+            } else if clean_stderr.contains("SEGV") {
                 "NULL_POINTER_OR_SEGV".to_string()
+            } else if clean_stderr.contains("LeakSanitizer:") {
+                "MEMORY_LEAK".to_string()
             } else {
                 "ADDRESS_SANITIZER_VIOLATION".to_string()
             };
 
-            let faulting_fn = Self::extract_faulting_frame(&combined);
-            let trace_hash = blake3::hash(stderr.as_bytes()).to_hex().to_string();
+            let faulting_fn = Self::extract_faulting_frame(&clean_stderr);
+            let trace_hash = blake3::hash(clean_stderr.as_bytes()).to_hex().to_string();
 
             return Some(CrashSignature {
                 fault_type,
@@ -92,17 +94,37 @@ impl CrashOracle {
             });
         }
 
+        if clean_stderr.contains("ThreadSanitizer:") {
+            return Some(CrashSignature {
+                fault_type: "DATA_RACE".to_string(),
+                faulting_function: Self::extract_faulting_frame(&clean_stderr),
+                exit_code,
+                sanitized_trace_blake3: blake3::hash(clean_stderr.as_bytes()).to_hex().to_string(),
+                detected_sanitizer: Some(SanitizerKind::ThreadSanitizer),
+            });
+        }
+
+        if clean_stderr.contains("MemorySanitizer:") {
+            return Some(CrashSignature {
+                fault_type: "UNINITIALIZED_MEMORY_READ".to_string(),
+                faulting_function: Self::extract_faulting_frame(&clean_stderr),
+                exit_code,
+                sanitized_trace_blake3: blake3::hash(clean_stderr.as_bytes()).to_hex().to_string(),
+                detected_sanitizer: Some(SanitizerKind::MemorySanitizer),
+            });
+        }
+
         // Detect UndefinedBehaviorSanitizer violations
-        if combined.contains("runtime error:") {
-            let fault_type = if combined.contains("signed integer overflow") {
+        if clean_stderr.contains("runtime error:") {
+            let fault_type = if clean_stderr.contains("signed integer overflow") {
                 "INTEGER_OVERFLOW".to_string()
-            } else if combined.contains("null pointer") {
+            } else if clean_stderr.contains("null pointer") {
                 "NULL_POINTER_DEREFERENCE".to_string()
             } else {
                 "UNDEFINED_BEHAVIOR".to_string()
             };
 
-            let trace_hash = blake3::hash(stderr.as_bytes()).to_hex().to_string();
+            let trace_hash = blake3::hash(clean_stderr.as_bytes()).to_hex().to_string();
             return Some(CrashSignature {
                 fault_type,
                 faulting_function: None,
@@ -112,32 +134,52 @@ impl CrashOracle {
             });
         }
 
-        // Detect Native Segmentation Fault / Abort
-        if exit_code == 139 || exit_code == -11 || combined.contains("Segmentation fault") {
-            return Some(CrashSignature {
-                fault_type: "SIGSEGV".to_string(),
-                faulting_function: None,
-                exit_code,
-                sanitized_trace_blake3: blake3::hash(combined.as_bytes()).to_hex().to_string(),
-                detected_sanitizer: None,
-            });
-        }
+        // Require non-zero exit for native signals or unhandled runtime panics
+        if exit_code != 0 {
+            if exit_code == 139 || exit_code == -11 || clean_stderr.contains("Segmentation fault") {
+                return Some(CrashSignature {
+                    fault_type: "SIGSEGV".to_string(),
+                    faulting_function: None,
+                    exit_code,
+                    sanitized_trace_blake3: blake3::hash(clean_stderr.as_bytes()).to_hex().to_string(),
+                    detected_sanitizer: None,
+                });
+            }
+            if exit_code == 134 || exit_code == -6 {
+                return Some(CrashSignature {
+                    fault_type: "SIGABRT".to_string(),
+                    faulting_function: Self::extract_faulting_frame(&clean_stderr),
+                    exit_code,
+                    sanitized_trace_blake3: blake3::hash(clean_stderr.as_bytes()).to_hex().to_string(),
+                    detected_sanitizer: None,
+                });
+            }
+            if matches!(exit_code, 132 | -4 | 135 | -7 | 136 | -8) {
+                return Some(CrashSignature {
+                    fault_type: format!("FATAL_SIGNAL_{}", exit_code),
+                    faulting_function: Self::extract_faulting_frame(&clean_stderr),
+                    exit_code,
+                    sanitized_trace_blake3: blake3::hash(clean_stderr.as_bytes()).to_hex().to_string(),
+                    detected_sanitizer: None,
+                });
+            }
 
-        // Detect Panic (Rust/Python)
-        if combined.contains("panicked at") || combined.contains("Traceback (most recent call last):") {
-            let fault_type = if combined.contains("panicked at") {
-                "RUST_PANIC".to_string()
-            } else {
-                "PYTHON_UNHANDLED_EXCEPTION".to_string()
-            };
+            // Detect Panic (Rust/Python) on stderr
+            if clean_stderr.contains("panicked at") || clean_stderr.contains("Traceback (most recent call last):") {
+                let fault_type = if clean_stderr.contains("panicked at") {
+                    "RUST_PANIC".to_string()
+                } else {
+                    "PYTHON_UNHANDLED_EXCEPTION".to_string()
+                };
 
-            return Some(CrashSignature {
-                fault_type,
-                faulting_function: Self::extract_faulting_frame(&combined),
-                exit_code,
-                sanitized_trace_blake3: blake3::hash(combined.as_bytes()).to_hex().to_string(),
-                detected_sanitizer: None,
-            });
+                return Some(CrashSignature {
+                    fault_type,
+                    faulting_function: Self::extract_faulting_frame(&clean_stderr),
+                    exit_code,
+                    sanitized_trace_blake3: blake3::hash(clean_stderr.as_bytes()).to_hex().to_string(),
+                    detected_sanitizer: None,
+                });
+            }
         }
 
         None
@@ -177,13 +219,12 @@ impl ReproducerSynthesizer {
         }
 
         let input_hash = blake3::hash(input_payload).to_hex().to_string();
-        let payload_b64 = String::from_utf8_lossy(input_payload).to_string();
 
         let mut config = ExecutionConfig::default();
         config.working_dir = working_dir.to_path_buf();
         config.command = command.to_vec();
         config.network_policy = NetworkPolicy::Denied;
-        config.env_vars.insert("PROOFLINE_INPUT_PAYLOAD".to_string(), payload_b64);
+        attach_input_payload(&mut config, input_payload);
 
         let mut baseline_signature: Option<CrashSignature> = None;
         let mut total_duration_ms = 0u64;
@@ -235,6 +276,181 @@ impl ReproducerSynthesizer {
         };
 
         Ok((witness, signature, epistemic_tier))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationFuzzResult {
+    pub iterations_executed: usize,
+    pub discovered_payload: Option<Vec<u8>>,
+    pub witness: Option<ReproductionWitness>,
+    pub crash_signature: Option<CrashSignature>,
+    pub epistemic_tier: EpistemicTier,
+}
+
+/// Bounded deterministic mutation fuzzer that discovers crashing witnesses from initial seeds
+/// inside an isolated `SandboxRunner` and verifies N-run determinism.
+pub struct MutationFuzzer;
+
+impl MutationFuzzer {
+    pub fn fuzz_until_reproduced<R: SandboxRunner>(
+        runner: &R,
+        working_dir: &Path,
+        command: &[String],
+        seed_inputs: &[Vec<u8>],
+        max_iterations: usize,
+        required_determinism_runs: u32,
+    ) -> Result<MutationFuzzResult> {
+        if max_iterations == 0 {
+            return Err(ProoflineError::ContractUnmet(
+                "Fuzzing budget max_iterations must be >= 1".to_string(),
+            ));
+        }
+
+        let mut corpus: Vec<Vec<u8>> = if seed_inputs.is_empty() {
+            vec![b"A".to_vec()]
+        } else {
+            seed_inputs.to_vec()
+        };
+
+        // High-signal vulnerability dictionary probes
+        let dictionary: &[&[u8]] = &[
+            b"%s%s%s%s%n",
+            b"../../etc/passwd",
+            b"' OR 1=1--",
+            b"; id",
+            &[b'A'; 128],
+            &[b'A'; 256],
+            &[b'A'; 1024],
+        ];
+        for probe in dictionary {
+            corpus.push(probe.to_vec());
+        }
+
+        let mut rng_state: u64 = 0x5EED_CAFE_BEEF_1337;
+        let mut iterations = 0usize;
+
+        for iter in 0..max_iterations {
+            iterations = iter + 1;
+            let candidate = if iter < corpus.len() {
+                corpus[iter].clone()
+            } else {
+                let base = &corpus[iter % corpus.len()];
+                Self::mutate_bytes(base, &mut rng_state)
+            };
+
+            let mut config = ExecutionConfig::default();
+            config.working_dir = working_dir.to_path_buf();
+            config.command = command.to_vec();
+            config.network_policy = NetworkPolicy::Denied;
+            attach_input_payload(&mut config, &candidate);
+
+            let out = runner.execute(&config)?;
+            if CrashOracle::evaluate_trace(out.exit_code, &out.stderr, &out.stdout).is_some() {
+                let (witness, sig, tier) = ReproducerSynthesizer::verify_deterministic_reproduction(
+                    runner,
+                    working_dir,
+                    command,
+                    &candidate,
+                    required_determinism_runs,
+                )?;
+                return Ok(MutationFuzzResult {
+                    iterations_executed: iterations,
+                    discovered_payload: Some(candidate),
+                    witness: Some(witness),
+                    crash_signature: Some(sig),
+                    epistemic_tier: tier,
+                });
+            }
+        }
+
+        Ok(MutationFuzzResult {
+            iterations_executed: iterations,
+            discovered_payload: None,
+            witness: None,
+            crash_signature: None,
+            epistemic_tier: EpistemicTier::Inconclusive,
+        })
+    }
+
+    fn mutate_bytes(base: &[u8], rng: &mut u64) -> Vec<u8> {
+        // Deterministic XorShift64 PRNG
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+
+        let mut out = if base.is_empty() {
+            vec![b'A']
+        } else {
+            base.to_vec()
+        };
+        match *rng % 4 {
+            0 => {
+                // Length expansion (buffer boundary pressure)
+                let extra = ((*rng >> 8) % 256) as usize + 16;
+                out.extend(std::iter::repeat_n(b'A', extra));
+            }
+            1 => {
+                // Deterministic byte flip
+                let idx = ((*rng >> 8) as usize) % out.len();
+                out[idx] ^= ((*rng >> 16) as u8) | 1;
+            }
+            2 => {
+                // Duplicate payload
+                if out.len() < 4096 {
+                    let copy = out.clone();
+                    out.extend_from_slice(&copy);
+                }
+            }
+            _ => {
+                // Append format/control delimiter
+                out.extend_from_slice(b"%n\x00../");
+            }
+        }
+        out
+    }
+}
+
+/// Compiles C/C++ targets inside an isolated `SandboxRunner` with sanitizer instrumentation.
+pub struct SanitizedBuildPipeline;
+
+impl SanitizedBuildPipeline {
+    pub fn compile_c_with_sanitizers<R: SandboxRunner>(
+        runner: &R,
+        working_dir: &Path,
+        compiler: &str,
+        source_rel_path: &str,
+        output_rel_path: &str,
+        sanitizers: &[SanitizerKind],
+    ) -> Result<proofline_sandbox::ExecutionOutput> {
+        for field in [compiler, source_rel_path, output_rel_path] {
+            if field.is_empty()
+                || field.starts_with('-')
+                || field.contains('\0')
+                || field.contains("..")
+            {
+                return Err(ProoflineError::IsolationViolation(format!(
+                    "Unsafe build parameter rejected: {:?}",
+                    field
+                )));
+            }
+        }
+
+        let mut cmd = vec![compiler.to_string()];
+        for san in sanitizers {
+            cmd.extend(san.clang_compiler_flags());
+        }
+        cmd.push(source_rel_path.to_string());
+        cmd.push("-o".to_string());
+        cmd.push(output_rel_path.to_string());
+
+        let mut config = ExecutionConfig::default();
+        config.working_dir = working_dir.to_path_buf();
+        config.command = cmd;
+        config.network_policy = NetworkPolicy::Denied;
+        config.read_only_rootfs = false;
+
+        runner.execute(&config)
     }
 }
 
@@ -311,5 +527,48 @@ WRITE of size 64 at 0x7ffd thread T0
         assert_eq!(witness.total_attempted_runs, 5);
         assert_eq!(sig.fault_type, "STACK_BUFFER_OVERFLOW");
         assert_eq!(tier, EpistemicTier::ConfirmedReproduced);
+    }
+
+    #[test]
+    fn test_mutation_fuzzer_discovers_length_overflow_from_short_seed() {
+        struct LengthThresholdRunner;
+        impl SandboxRunner for LengthThresholdRunner {
+            fn execute(&self, config: &ExecutionConfig) -> Result<ExecutionOutput> {
+                let len = config.stdin_input.as_ref().map(|v| v.len()).unwrap_or(0);
+                if len >= 128 {
+                    return Ok(ExecutionOutput {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: "==1==ERROR: AddressSanitizer: stack-buffer-overflow on 0x7fff\n    #0 0x401000 in parse_buf /app/main.c:9".to_string(),
+                        duration_ms: 3,
+                        stdout_blake3: "h1".to_string(),
+                        stderr_blake3: "h2".to_string(),
+                    });
+                }
+                Ok(ExecutionOutput {
+                    exit_code: 0,
+                    stdout: "ok".to_string(),
+                    stderr: String::new(),
+                    duration_ms: 2,
+                    stdout_blake3: "h3".to_string(),
+                    stderr_blake3: "h4".to_string(),
+                })
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let res = MutationFuzzer::fuzz_until_reproduced(
+            &LengthThresholdRunner,
+            temp_dir.path(),
+            &["/workspace/target".to_string()],
+            &[b"hello".to_vec()],
+            32,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(res.epistemic_tier, EpistemicTier::ConfirmedReproduced);
+        assert!(res.discovered_payload.unwrap().len() >= 128);
+        assert_eq!(res.witness.unwrap().successful_runs, 3);
     }
 }

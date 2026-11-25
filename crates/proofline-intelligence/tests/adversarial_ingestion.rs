@@ -73,3 +73,36 @@ fn test_symlink_escape_to_sensitive_path_rejected() {
         }
     }
 }
+
+#[test]
+fn test_dangling_symlink_escape_rejected() {
+    let dir = tempdir().unwrap();
+    let repo_dir = dir.path().join("untrusted_repo");
+    fs::create_dir(&repo_dir).unwrap();
+
+    #[cfg(unix)]
+    {
+        let dangling_link = repo_dir.join("dangling_escape");
+        std::os::unix::fs::symlink("../../../../tmp/definitely_nonexistent_proofline_target", dangling_link).unwrap();
+
+        let engine = IngestionEngine::default();
+        let result = engine.inspect_repository(&repo_dir);
+        assert!(matches!(result, Err(ProoflineError::IsolationViolation(_))));
+    }
+}
+
+#[test]
+fn test_root_hash_changes_on_same_size_content_modification() {
+    let dir = tempdir().unwrap();
+    let src_file = dir.path().join("app.c");
+    fs::write(&src_file, b"int main() { return 0; }").unwrap();
+
+    let engine = IngestionEngine::default();
+    let hash1 = engine.inspect_repository(dir.path()).unwrap().root_hash_blake3;
+
+    // Modify content keeping exact same filename and byte length
+    fs::write(&src_file, b"int main() { return 1; }").unwrap();
+    let hash2 = engine.inspect_repository(dir.path()).unwrap().root_hash_blake3;
+
+    assert_ne!(hash1, hash2, "Root hash must reflect file content changes");
+}

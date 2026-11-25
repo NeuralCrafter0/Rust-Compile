@@ -5,8 +5,9 @@
 
 use proofline_core::{DifferentialVerificationResult, EpistemicTier, ProoflineError, Result};
 use proofline_fuzzer::{CrashOracle, CrashSignature};
-use proofline_sandbox::{ExecutionConfig, NetworkPolicy, SandboxRunner};
+use proofline_sandbox::{attach_input_payload, ExecutionConfig, NetworkPolicy, SandboxRunner};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +31,7 @@ pub struct AdversarialMutator;
 
 impl AdversarialMutator {
     /// Generates mutated variants of an exploit reproducer targeting common patch bypass flaws:
-    /// URL double-encodings, null byte injections, path normalization variants, and integer bounds.
+    /// URL double-encodings, null byte injections, path normalization variants, SQLi/CMDi escapes, and integer bounds.
     pub fn generate_mutations(base_payload: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut mutations = Vec::new();
         let payload_str = String::from_utf8_lossy(base_payload);
@@ -57,10 +58,43 @@ impl AdversarialMutator {
                 "BACKSLASH_TRAVERSAL".to_string(),
                 payload_str.replace("../", "..\\").into_bytes(),
             ));
-            // Null-byte termination bypass
+            // Semicolon path parameter bypass (e.g., nginx/Tomcat ..;/)
+            mutations.push((
+                "SEMICOLON_PATH_PARAM_BYPASS".to_string(),
+                payload_str.replace("../", "..;/").into_bytes(),
+            ));
+            // Null-byte termination bypass (URL-encoded and raw NUL)
             let mut null_terminated = base_payload.to_vec();
             null_terminated.extend_from_slice(b"%00.png");
             mutations.push(("NULL_BYTE_INJECTION".to_string(), null_terminated));
+        }
+
+        // SQL Injection bypass variants (CWE-89)
+        if payload_str.contains('\'') || payload_str.to_ascii_lowercase().contains("or 1=1") {
+            mutations.push((
+                "SQLI_COMMENT_WHITESPACE_BYPASS".to_string(),
+                payload_str.replace(' ', "/**/").into_bytes(),
+            ));
+            mutations.push((
+                "SQLI_CASE_TOGGLE_BYPASS".to_string(),
+                payload_str
+                    .replace("OR", "oR")
+                    .replace("or", "Or")
+                    .replace("SELECT", "SeLeCt")
+                    .into_bytes(),
+            ));
+        }
+
+        // Command Injection bypass variants (CWE-78)
+        if payload_str.contains(';') || payload_str.contains("&&") {
+            mutations.push((
+                "CMDI_NEWLINE_SUBSTITUTION".to_string(),
+                payload_str.replace(';', "\n").replace("&&", "\n").into_bytes(),
+            ));
+            mutations.push((
+                "CMDI_IFS_WHITESPACE_BYPASS".to_string(),
+                payload_str.replace(' ', "${IFS}").into_bytes(),
+            ));
         }
 
         // Buffer length perturbation (Off-by-one / Boundary checks)
@@ -71,6 +105,17 @@ impl AdversarialMutator {
         let mut double_size = base_payload.to_vec();
         double_size.extend_from_slice(base_payload);
         mutations.push(("BOUNDARY_DOUBLE_PAYLOAD_SIZE".to_string(), double_size));
+
+        // Raw embedded NUL terminator check
+        let mut raw_nul = base_payload.to_vec();
+        raw_nul.push(0x00);
+        raw_nul.extend_from_slice(b"SAFE");
+        mutations.push(("BOUNDARY_RAW_NUL_TERMINATOR".to_string(), raw_nul));
+
+        // Deduplicate identical byte payloads while preserving deterministic order
+        let mut seen = HashSet::new();
+        seen.insert(base_payload.to_vec());
+        mutations.retain(|(_, bytes)| seen.insert(bytes.clone()));
 
         mutations
     }
@@ -83,7 +128,7 @@ impl DifferentialVerificationEngine {
     /// 1. Verifies reproducer on V_vuln (must crash).
     /// 2. Verifies reproducer on V_patch (must be mitigated).
     /// 3. Fuzzes V_patch with adversarial mutations to detect bypasses.
-    /// 4. Executes golden regression suite to detect semantic divergence.
+    /// 4. Executes golden regression suite across V_vuln and V_patch to detect semantic divergence.
     pub fn verify_patch<RV: SandboxRunner, RP: SandboxRunner>(
         vuln_runner: &RV,
         patch_runner: &RP,
@@ -96,10 +141,7 @@ impl DifferentialVerificationEngine {
         config_vuln.working_dir = working_dir.to_path_buf();
         config_vuln.command = command.to_vec();
         config_vuln.network_policy = NetworkPolicy::Denied;
-        config_vuln.env_vars.insert(
-            "PROOFLINE_INPUT_PAYLOAD".to_string(),
-            String::from_utf8_lossy(reproducer_payload).to_string(),
-        );
+        attach_input_payload(&mut config_vuln, reproducer_payload);
 
         // Step 1: Execute on V_vuln - Must trigger crash oracle
         let vuln_output = vuln_runner.execute(&config_vuln)?;
@@ -153,10 +195,7 @@ impl DifferentialVerificationEngine {
 
         for (mut_name, mut_payload) in &mutations {
             let mut mut_config = config_patch.clone();
-            mut_config.env_vars.insert(
-                "PROOFLINE_INPUT_PAYLOAD".to_string(),
-                String::from_utf8_lossy(mut_payload).to_string(),
-            );
+            attach_input_payload(&mut mut_config, mut_payload);
 
             let mut_output = patch_runner.execute(&mut_config)?;
             if let Some(crash_sig) = CrashOracle::evaluate_trace(
@@ -172,21 +211,35 @@ impl DifferentialVerificationEngine {
             }
         }
 
-        // Step 4: Golden Regression Suite Execution
+        // Step 4: Golden Regression Suite Differential Comparison (V_vuln vs V_patch)
         let mut regressions_detected = false;
         let mut regression_notes = Vec::new();
 
         for (idx, reg_payload) in regression_test_inputs.iter().enumerate() {
             let mut reg_config = config_patch.clone();
-            reg_config.env_vars.insert(
-                "PROOFLINE_INPUT_PAYLOAD".to_string(),
-                String::from_utf8_lossy(reg_payload).to_string(),
-            );
+            attach_input_payload(&mut reg_config, reg_payload);
 
-            let reg_output = patch_runner.execute(&reg_config)?;
-            if reg_output.exit_code != 0 {
+            let vuln_reg_output = vuln_runner.execute(&reg_config)?;
+            let patch_reg_output = patch_runner.execute(&reg_config)?;
+
+            if patch_reg_output.exit_code != 0 {
                 regressions_detected = true;
-                regression_notes.push(format!("Regression in test case #{}: exit code {}", idx, reg_output.exit_code));
+                regression_notes.push(format!(
+                    "Regression in test case #{}: V_patch exited with code {}",
+                    idx, patch_reg_output.exit_code
+                ));
+            } else if patch_reg_output.exit_code != vuln_reg_output.exit_code
+                || patch_reg_output.stdout_blake3 != vuln_reg_output.stdout_blake3
+            {
+                regressions_detected = true;
+                regression_notes.push(format!(
+                    "Semantic invariant drift in test case #{}: V_vuln (exit {}, out {}) != V_patch (exit {}, out {})",
+                    idx,
+                    vuln_reg_output.exit_code,
+                    vuln_reg_output.stdout_blake3,
+                    patch_reg_output.exit_code,
+                    patch_reg_output.stdout_blake3
+                ));
             }
         }
 
@@ -334,5 +387,49 @@ mod tests {
         assert!(!report.bypasses.is_empty(), "Adversarial mutator should detect URL encoding bypass!");
         assert_eq!(report.final_epistemic_tier, EpistemicTier::ConfirmedReproduced);
         assert_eq!(report.bypasses[0].mutation_name, "URL_ENCODING");
+    }
+
+    #[test]
+    fn test_semantic_invariant_drift_detected_even_with_exit_0() {
+        struct DriftingPatchRunner;
+        impl SandboxRunner for DriftingPatchRunner {
+            fn execute(&self, _config: &ExecutionConfig) -> Result<ExecutionOutput> {
+                // Returns exit 0 but different stdout on regression input compared to V_vuln!
+                Ok(ExecutionOutput {
+                    exit_code: 0,
+                    stdout: "CorruptedOutput".to_string(),
+                    stderr: String::new(),
+                    duration_ms: 5,
+                    stdout_blake3: blake3::hash(b"CorruptedOutput").to_hex().to_string(),
+                    stderr_blake3: "hash".to_string(),
+                })
+            }
+        }
+
+        let vuln_runner = MockBranchRunner {
+            crashes_on_substring: None,
+            crashes_on_reproducer: true,
+        };
+        let patch_runner = DriftingPatchRunner;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cmd = vec!["/app/server".to_string()];
+        let reproducer = b"GET ../../etc/passwd HTTP/1.1";
+        let regression_suite = vec![b"GET /index.html HTTP/1.1".to_vec()];
+
+        let (report, diff_result) = DifferentialVerificationEngine::verify_patch(
+            &vuln_runner,
+            &patch_runner,
+            temp_dir.path(),
+            &cmd,
+            reproducer,
+            &regression_suite,
+        )
+        .unwrap();
+
+        assert!(report.regressions_detected);
+        assert!(!diff_result.regression_tests_passed);
+        assert_eq!(report.final_epistemic_tier, EpistemicTier::Inconclusive);
+        assert!(!diff_result.execution_divergence_notes.is_empty());
     }
 }

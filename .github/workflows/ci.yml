@@ -1,0 +1,28 @@
+name: Proofline CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  workspace-tests:
+    name: Build, Test & Benchmark (Alpine musl)
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/rust:alpine
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run full workspace unit, integration, and benchmark suites
+        run: cargo test --workspace --locked
+      - name: Build release CLI binary
+        run: cargo build --release -p proofline-cli --locked
+      - name: Verify CLI help & static inspection smoke test
+        run: |
+          ./target/release/proofline --help
+          ./target/release/proofline inspect ./tests/adversarial-repos/malicious-makefile --json
+          test ! -f /tmp/proofline_compromised_marker
