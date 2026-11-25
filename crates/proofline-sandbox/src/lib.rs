@@ -1000,7 +1000,7 @@ mod tests {
         cfg.command = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "printf 'guest-ok\\x1b[31m\\n'".to_string(),
+            "printf 'guest-ok\\033[31m\\n'".to_string(),
         ];
 
         let out = run_firecracker_vsock_client(&mut host_side, DEFAULT_VSOCK_PORT, &cfg).unwrap();

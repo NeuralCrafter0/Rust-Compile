@@ -33,7 +33,7 @@ fn test_live_firecracker_kvm_microvm_vsock_roundtrip() {
     cfg.command = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        "uname -s -r && ls -1 /sys/class/net && printf 'fc-ok\\x1b[31m\\n'".to_string(),
+        "uname -s -r && ls -1 /sys/class/net && printf 'fc-ok\\033[31m\\n'".to_string(),
     ];
 
     let out = runner
